@@ -284,7 +284,7 @@ def submit(
     # propose only a bounded data IR, then Frappe independently revalidates and
     # executes it as this session user. The provider never receives credentials
     # and never gets a SQL/method/URL escape hatch.
-    if ("live_read" in intent["outcomes"] and not form_evidence) or _LIVE_READ_REQUEST.search(text):
+    if not form_evidence and ("live_read" in intent["outcomes"] or _LIVE_READ_REQUEST.search(text)):
         read_request_id = f"read-{sha256(f'{user}:{conversation}:{key}'.encode()).hexdigest()[:32]}"
         catalog = build_read_catalog(text, requested_scope, user)
         if not catalog:

@@ -109,6 +109,7 @@ class TestMusterSecurity(FrappeTestCase):
                 "action_hash": "0" * 64,
             }
         )
+        frappe.set_user(self.operator)
         with self.assertRaises(frappe.ValidationError):
             approval.insert(ignore_permissions=True)
 

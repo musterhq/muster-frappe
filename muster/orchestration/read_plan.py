@@ -4,14 +4,13 @@ import hashlib
 import json
 import re
 import time
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
 import frappe
 from frappe import _
 from frappe.model import get_permitted_fields
-from frappe.utils import now_datetime
 
 READ_PLANS_PATH = "/v1/integrations/frappe/read-plans"
 MAX_CATALOG_DOCTYPES = 120
@@ -22,6 +21,7 @@ MAX_EVIDENCE_BYTES = 24_000
 MAX_QUERY_SECONDS = 5.0
 _FIELD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,139}$")
 _SECRET = re.compile(r"(?:password|passwd|secret|api[_-]?key|token|authorization|cookie|private[_-]?key|salt)", re.I)
+_EXECUTABLE = re.compile(r"(?:^|_)(?:script|javascript|query|template|condition)(?:$|_)", re.I)
 _OPERATORS = {"=", "!=", "<", "<=", ">", ">=", "in", "not in", "between", "like", "is"}
 _AGGREGATES = {"count", "sum", "avg", "min", "max"}
 _STRUCTURAL = {"Button", "Column Break", "Fold", "Heading", "HTML", "Section Break", "Tab Break", "Table", "Table MultiSelect"}
@@ -34,9 +34,14 @@ class FrappeReadPlanError(frappe.ValidationError):
 
 def build_read_catalog(question: str, scope: dict[str, Any], user: str) -> list[dict[str, Any]]:
     """Expose only schema the current user can read; never rows or permission internals."""
+    if (frappe.session.user or "").lower() != user.lower():
+        raise FrappeReadPlanError(_("Read catalog actor does not match the current session"))
     words = {word.lower() for word in re.findall(r"[A-Za-z0-9]+", question) if len(word) >= 3}
     selected = str(scope.get("doctype") or "").strip()
-    readable = set(frappe.get_user(user).get_can_read() or [])
+    # Frappe v16's get_user() is deliberately session-bound and accepts no
+    # username argument. The explicit equality check above prevents a caller
+    # from using this catalog as a cross-user permission oracle.
+    readable = set(frappe.get_user().get_can_read() or [])
     candidates: list[tuple[int, str]] = []
     for doctype in readable:
         if not isinstance(doctype, str) or len(doctype) > 140 or not frappe.db.exists("DocType", doctype):
@@ -56,10 +61,10 @@ def build_read_catalog(question: str, scope: dict[str, Any], user: str) -> list[
         meta = frappe.get_meta(doctype)
         fields: list[tuple[int, str]] = []
         for fieldname in sorted(permitted):
-            if not _FIELD.fullmatch(fieldname) or _SECRET.search(fieldname):
+            if not _FIELD.fullmatch(fieldname) or _SECRET.search(fieldname) or _EXECUTABLE.search(fieldname):
                 continue
             field = meta.get_field(fieldname)
-            if field and (field.fieldtype in _STRUCTURAL or field.fieldtype == "Password"):
+            if field and (field.fieldtype in _STRUCTURAL or field.fieldtype in {"Password", "Code"}):
                 continue
             field_tokens = {word.lower() for word in re.findall(r"[A-Za-z0-9]+", f"{fieldname} {getattr(field, 'label', '') if field else ''}") if len(word) >= 3}
             common = fieldname in {"name", "title", "subject", "status", "company", "customer", "supplier", "employee", "posting_date", "transaction_date", "due_date", "modified"}
@@ -96,7 +101,7 @@ def execute_read_plan(plan: Any, request_id: str, user: str) -> dict[str, Any]:
         "kind": "fresh_permission_filtered_frappe_evidence",
         "requestId": request_id,
         "actor": user,
-        "executedAt": now_datetime().isoformat(),
+        "executedAt": datetime.now(UTC).isoformat(),
         "permissionFiltered": True,
         "queryHash": _hash(value),
         "elapsedMs": elapsed_ms,

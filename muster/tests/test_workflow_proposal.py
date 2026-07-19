@@ -301,6 +301,10 @@ class TestWorkflowProposalValidation(IntegrationTestCase):
                 "muster.orchestration.gateway_runtime._caller_capabilities",
                 return_value=["frappe.invoice.read"],
             ),
+            patch(
+                "muster.orchestration.workflow_proposal._caller_capabilities",
+                return_value=["frappe.invoice.read"],
+            ),
             patch("muster.orchestration.workflow_proposal.frappe.enqueue") as enqueue,
         ):
             started = start_published_proposal_mission(
