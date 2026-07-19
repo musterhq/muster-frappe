@@ -195,3 +195,34 @@ class TestMusterOnboarding(FrappeTestCase):
         self.assertTrue(context.requires_login)
         self.assertIn("redirect-to=", context.login_url)
         consume.assert_not_called()
+
+    def test_callback_page_commits_verified_trust(self):
+        frappe.form_dict = frappe._dict({"code": "verified-code", "state": "signed-state"})
+        context = frappe._dict()
+        with (
+            patch.object(muster_connect, "complete", return_value={"connected": True}),
+            patch.object(frappe.db, "commit") as commit,
+            patch.object(frappe.db, "rollback") as rollback,
+        ):
+            muster_connect.get_context(context)
+        self.assertTrue(context.success)
+        commit.assert_called_once_with()
+        rollback.assert_not_called()
+
+    def test_callback_page_rolls_back_failed_trust(self):
+        frappe.form_dict = frappe._dict({"code": "bad-code", "state": "signed-state"})
+        context = frappe._dict()
+        with (
+            patch.object(
+                muster_connect,
+                "complete",
+                side_effect=onboarding.MusterOnboardingError("verification failed"),
+            ),
+            patch.object(frappe.db, "commit") as commit,
+            patch.object(frappe.db, "rollback") as rollback,
+        ):
+            muster_connect.get_context(context)
+        self.assertFalse(context.success)
+        self.assertIn("No trust was created", context.error)
+        commit.assert_not_called()
+        rollback.assert_called_once_with()

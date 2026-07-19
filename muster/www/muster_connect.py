@@ -53,13 +53,20 @@ def get_context(context):
         return context
     try:
         complete(code, state)
+        # Frappe's normal request transaction does not commit mutations made
+        # while rendering a GET website route. The OAuth redirect must remain
+        # a browser GET, so commit only after both challenges have been
+        # verified and the complete trust record has been persisted.
+        frappe.db.commit()
         context.success = True
     except MusterOnboardingError:
+        frappe.db.rollback()
         context.error = (
             "Muster could not verify the connection. No trust was created; "
             "return to settings and try again."
         )
     except Exception:
+        frappe.db.rollback()
         # Do not capture request arguments or stack locals: OAuth codes, verifiers,
         # and issued credentials must never enter Error Log.
         frappe.log_error(

@@ -298,6 +298,21 @@ def discovery() -> dict[str, Any]:
         origin = _site_origin()
     except (GatewayClientError, MusterOnboardingError):
         origin = None
+    settings = frappe.get_single("Muster Settings")
+    binding_status = (
+        frappe.db.get_value("Muster Site Binding", settings.site_binding, "status")
+        if settings.site_binding
+        else None
+    )
+    connected = bool(
+        settings.enabled
+        and settings.binding_status == "Trusted"
+        and settings.gateway_url
+        and settings.site_binding
+        and binding_status == "Trusted"
+        and settings.get_password("gateway_bearer_token", raise_exception=False)
+        and settings.get_password("run_event_hmac_secret", raise_exception=False)
+    )
     return {
         "product": "Muster for Frappe",
         "protocol_version": "1.0",
@@ -305,6 +320,9 @@ def discovery() -> dict[str, Any]:
         "frappe_version": getattr(frappe, "__version__", "unknown"),
         "site_origin": origin,
         "https_required": True,
+        # A state label is safe to expose and lets the CLI detect asymmetric
+        # trust instead of trusting a stale gateway-side binding.
+        "connection_state": "trusted" if connected else "setup_required",
         "flows": ["oauth_pkce", "api_credentials"],
         "capabilities": list(CAPABILITIES),
     }
@@ -351,7 +369,7 @@ def begin(gateway_url: str, site_url: str | None = None) -> dict[str, Any]:
     }
 
 
-@frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def complete(code: str, state: str) -> dict[str, Any]:
     pending = _consume_pending(state)
     gateway_origin = normalized_https_origin(pending["gateway_origin"])
