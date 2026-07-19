@@ -1,0 +1,32 @@
+{
+  "doctype": "DocType",
+  "name": "Muster Ask Turn",
+  "module": "Muster",
+  "autoname": "MST-ASK-.YYYY.-.#####",
+  "title_field": "conversation_id",
+  "track_changes": 1,
+  "search_fields": "conversation_id,status,requested_by",
+  "field_order": ["requested_by", "conversation_id", "request_id", "status", "expires_at", "prompt_secret", "prompt_hash", "scope_json", "scope_hash", "outcomes_json", "handoffs_json", "clarification", "accepted_handoff_id", "accepted_at", "workflow_proposal", "development_proposal"],
+  "fields": [
+    {"fieldname": "requested_by", "fieldtype": "Link", "label": "Requested By", "options": "User", "reqd": 1, "read_only": 1, "in_list_view": 1},
+    {"fieldname": "conversation_id", "fieldtype": "Data", "label": "Conversation", "reqd": 1, "read_only": 1},
+    {"fieldname": "request_id", "fieldtype": "Data", "label": "Request", "reqd": 1, "unique": 1, "read_only": 1},
+    {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "Offered\nAccepted\nExpired", "default": "Offered", "reqd": 1, "read_only": 1, "in_list_view": 1},
+    {"fieldname": "expires_at", "fieldtype": "Datetime", "label": "Expires At", "reqd": 1, "read_only": 1},
+    {"fieldname": "prompt_secret", "fieldtype": "Password", "label": "Encrypted Prompt", "reqd": 1, "hidden": 1, "read_only": 1},
+    {"fieldname": "prompt_hash", "fieldtype": "Data", "label": "Prompt SHA-256", "reqd": 1, "read_only": 1},
+    {"fieldname": "scope_json", "fieldtype": "Code", "label": "Context", "options": "JSON", "reqd": 1, "read_only": 1},
+    {"fieldname": "scope_hash", "fieldtype": "Data", "label": "Context SHA-256", "reqd": 1, "read_only": 1},
+    {"fieldname": "outcomes_json", "fieldtype": "Code", "label": "Admitted Outcomes", "options": "JSON", "reqd": 1, "read_only": 1},
+    {"fieldname": "handoffs_json", "fieldtype": "Code", "label": "Inert Handoffs", "options": "JSON", "reqd": 1, "read_only": 1},
+    {"fieldname": "clarification", "fieldtype": "Small Text", "label": "Clarification", "read_only": 1},
+    {"fieldname": "accepted_handoff_id", "fieldtype": "Data", "label": "Accepted Handoff", "read_only": 1},
+    {"fieldname": "accepted_at", "fieldtype": "Datetime", "label": "Accepted At", "read_only": 1},
+    {"fieldname": "workflow_proposal", "fieldtype": "Link", "label": "Workflow Proposal", "options": "Muster Workflow Proposal", "read_only": 1},
+    {"fieldname": "development_proposal", "fieldtype": "Link", "label": "Development Proposal", "options": "Muster Development Proposal", "read_only": 1}
+  ],
+  "permissions": [
+    {"role": "All", "read": 1, "create": 1},
+    {"role": "Muster Auditor", "read": 1, "export": 1}
+  ]
+}
