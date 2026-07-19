@@ -173,7 +173,9 @@ def assert_form_schema_binding(binding: dict[str, Any], *, user: str | None = No
 
 def _permission_levels(meta: Any, roles: set[str], permission: str, actor: str) -> set[int]:
     levels = {int(row.permlevel or 0) for row in meta.permissions if row.role in roles and int(row.get(permission) or 0)}
-    if "System Manager" in roles or actor == "Administrator":
+    if actor == "Administrator":
+        levels.update(int(field.permlevel or 0) for field in meta.fields)
+    elif "System Manager" in roles:
         levels.add(0)
     return levels
 

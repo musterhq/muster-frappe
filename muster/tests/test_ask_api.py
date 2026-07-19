@@ -7,7 +7,7 @@ try:
     import frappe
     from frappe.tests.utils import FrappeTestCase
 
-    from muster.api.ask import _require_user, accept_handoff, poll, submit
+    from muster.api.ask import _prompt_form_doctype, _require_user, accept_handoff, poll, submit
 except ModuleNotFoundError as exc:
     raise unittest.SkipTest("Frappe integration tests require an installed test site") from exc
 
@@ -221,6 +221,30 @@ class TestAskAPI(FrappeTestCase):
         self.assertIn("custom_tier", context)
         self.assertIn("property_setters", context)
         self.assertNotIn("script source", context.lower())
+
+    def test_home_prompt_resolves_one_explicit_form_target_and_includes_writable_fields(self):
+        readable = SimpleNamespace(get_can_read=lambda: ["Customer", "Custom Field", "Property Setter"])
+        with (
+            patch.object(frappe, "get_user", return_value=readable),
+            patch.object(frappe.db, "exists", return_value=True),
+            patch.object(frappe, "has_permission", return_value=True),
+        ):
+            target = _prompt_form_doctype(
+                "What custom fields and property setters currently affect Customer, and which fields can I write?",
+                "", self.user,
+            )
+        self.assertEqual(target, "Customer")
+
+        context = __import__("muster.api.ask", fromlist=["_merge_form_evidence"])._merge_form_evidence({}, {
+            "doctype": "Customer", "authority": {"read": True, "write": True},
+            "fields": [
+                {"fieldname": "customer_name", "label": "Customer Name", "fieldtype": "Data", "permlevel": 0, "required": True, "writable": True, "provenance": {"source": "doctype_field", "property_setters": []}},
+                {"fieldname": "tax_id", "label": "Tax ID", "fieldtype": "Data", "permlevel": 0, "required": False, "writable": False, "provenance": {"source": "doctype_field", "property_setters": []}},
+            ],
+            "doctype_property_setters": [], "workflow": None, "client_scripts": [], "schema_hash": "a" * 64, "revision": "b" * 64,
+        })["summary"]
+        self.assertIn('"writable_fields":[{"fieldname":"customer_name"', context)
+        self.assertNotIn('"fieldname":"tax_id","fieldtype"', context)
 
     def test_handoff_requires_confirmation_and_creates_only_a_proposal(self):
         frappe.set_user(self.user)

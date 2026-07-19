@@ -75,6 +75,11 @@ class TestEffectiveFormSchema(FrappeTestCase):
         self.assertNotIn("script", calls[0])
         self.assertEqual(set(metadata[0]), {"name", "view", "modified"})
 
+    def test_administrator_has_effective_access_to_all_field_permlevels(self):
+        meta = self._meta()
+        levels = form_schema._permission_levels(meta, {"System Manager"}, "write", "Administrator")
+        self.assertEqual(levels, {0, 1})
+
     def test_stale_hash_and_unsupported_lifecycle_never_reach_browser_execution(self):
         snapshot = {
             "doctype": "Customer", "schema_hash": "a" * 64, "revision": "b" * 64,

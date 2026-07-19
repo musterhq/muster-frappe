@@ -33,7 +33,7 @@ _LIVE_READ_REQUEST = re.compile(
     re.IGNORECASE,
 )
 _FORM_SCHEMA_REQUEST = re.compile(
-    r"\b(?:form|field|custom field|property setter|customi[sz]|mandatory|required|read[ -]?only|hidden|workflow|client script|layout)\b",
+    r"\b(?:forms?|fields?|custom fields?|property setters?|customi[sz]|mandatory|required|read[ -]?only|hidden|workflows?|client scripts?|layouts?)\b",
     re.IGNORECASE,
 )
 _ASK_OUTCOMES = {
@@ -195,6 +195,9 @@ def _merge_form_evidence(context: dict[str, Any], snapshot: dict[str, Any]) -> d
         "doctype": snapshot.get("doctype"),
         "authority": snapshot.get("authority"),
         "customized_fields": customized[:100],
+        "writable_fields": [{key: field.get(key) for key in (
+            "fieldname", "label", "fieldtype", "permlevel", "required"
+        )} for field in (snapshot.get("fields") or []) if isinstance(field, dict) and field.get("writable")][:100],
         "doctype_property_setters": (snapshot.get("doctype_property_setters") or [])[:100],
         "workflow": snapshot.get("workflow"),
         "client_scripts": (snapshot.get("client_scripts") or [])[:100],
@@ -214,6 +217,36 @@ def _merge_form_evidence(context: dict[str, Any], snapshot: dict[str, Any]) -> d
     if len(summary.encode()) > 32_000:
         frappe.throw(_("The permission-filtered form evidence exceeded its safe size limit"), frappe.ValidationError)
     return {**context, "summary": summary}
+
+
+def _prompt_form_doctype(text: str, selected: str, user: str) -> str | None:
+    """Resolve one explicit form target from trusted Meta, never from model output."""
+    if selected:
+        # The page value remains only a target hint. effective_form_schema performs
+        # the authoritative existence and live actor permission checks.
+        return selected
+    if not _FORM_SCHEMA_REQUEST.search(text):
+        return None
+    readable = frappe.get_user().get_can_read() or []
+    ranked: list[tuple[int, int, str]] = []
+    for doctype in readable:
+        if not isinstance(doctype, str) or not doctype or len(doctype) > 140 or not frappe.db.exists("DocType", doctype):
+            continue
+        escaped = re.escape(doctype)
+        if not re.search(rf"(?<!\w){escaped}(?!\w)", text, re.IGNORECASE):
+            continue
+        score = 10
+        if re.search(rf"[`\"']{escaped}[`\"']", text, re.IGNORECASE):
+            score = 80
+        elif re.search(rf"\b(?:for|on|of|affect(?:s|ing)?|customi[sz](?:e|es|ing|ed)?)\s+(?:the\s+)?{escaped}(?!\w)", text, re.IGNORECASE):
+            score = 60
+        ranked.append((score, len(doctype), doctype))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)
+    best_score = ranked[0][0]
+    best = [row for row in ranked if row[0] == best_score]
+    return best[0][2] if len(best) == 1 else None
 
 
 @frappe.whitelist()
@@ -277,8 +310,9 @@ def submit(
         }
     form_evidence = False
     selected_doctype = str(requested_scope.get("doctype") or "").strip()
-    if "live_read" in intent["outcomes"] and selected_doctype and _FORM_SCHEMA_REQUEST.search(text):
-        context = _merge_form_evidence(context, effective_form_schema(selected_doctype, user=user))
+    form_doctype = _prompt_form_doctype(text, selected_doctype, user)
+    if "live_read" in intent["outcomes"] and form_doctype and _FORM_SCHEMA_REQUEST.search(text):
+        context = _merge_form_evidence(context, effective_form_schema(form_doctype, user=user))
         form_evidence = True
     # Broad live-data questions use two separate trust stages: the gateway may
     # propose only a bounded data IR, then Frappe independently revalidates and
