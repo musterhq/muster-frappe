@@ -49,8 +49,8 @@ _HANDOFF_LABELS = {
 
 
 def _require_user() -> str:
-    user = (frappe.session.user or "").strip().lower()
-    if not user or user == "guest":
+    user = (frappe.session.user or "").strip()
+    if not user or user.lower() == "guest":
         frappe.throw(_("Sign in to ask Muster"), frappe.PermissionError)
     if not cint(frappe.db.get_value("User", user, "enabled")):
         frappe.throw(_("This user is not active"), frappe.PermissionError)
@@ -336,7 +336,10 @@ def submit(
             "message": {
                 "surfaceId": f"frappe:{binding.site_id}",
                 "conversationId": conversation,
-                "senderId": user,
+                # The gateway protocol uses a lower-case canonical identity,
+                # while local Frappe permission checks and ownership retain
+                # the exact User name (notably the built-in Administrator).
+                "senderId": identity["user"],
                 "text": text,
             },
             "identity": identity,

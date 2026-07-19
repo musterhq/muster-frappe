@@ -7,7 +7,7 @@ try:
     import frappe
     from frappe.tests.utils import FrappeTestCase
 
-    from muster.api.ask import accept_handoff, poll, submit
+    from muster.api.ask import _require_user, accept_handoff, poll, submit
 except ModuleNotFoundError as exc:
     raise unittest.SkipTest("Frappe integration tests require an installed test site") from exc
 
@@ -79,6 +79,10 @@ class TestAskAPI(FrappeTestCase):
         self.assertNotIn("pollUrl", result)
         self.assertEqual(result["handoffs"], [])
         self.assertTrue(result["turn_id"].startswith("MST-ASK-"))
+
+    def test_builtin_administrator_keeps_exact_local_identity(self):
+        frappe.set_user("Administrator")
+        self.assertEqual(_require_user(), "Administrator")
 
     def test_poll_is_bound_to_current_user_and_filters_reasoning_and_untrusted_artifacts(self):
         gateway = Mock()
