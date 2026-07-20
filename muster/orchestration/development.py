@@ -288,20 +288,80 @@ def apply_reviewed_patch(
             patch_file.write_bytes(patch)
             os.chmod(patch_file, stat.S_IRUSR | stat.S_IWUSR)
             directory_args = [] if snapshot.repository_relative_root == "." else [f"--directory={snapshot.repository_relative_root}"]
-            _git(snapshot.repository_root, "apply", "--check", "--whitespace=error-all", *directory_args, str(patch_file))
-            _git(snapshot.repository_root, "apply", "--whitespace=error-all", *directory_args, str(patch_file))
+            _git(snapshot.repository_root, "apply", "--index", "--check", "--whitespace=error-all", *directory_args, str(patch_file))
+            _git(snapshot.repository_root, "apply", "--index", "--whitespace=error-all", *directory_args, str(patch_file))
             resulting = _git(
-                snapshot.source_root, "diff", "--no-ext-diff", "--no-color", "--unified=3",
+                snapshot.source_root, "diff", "--cached", "--no-ext-diff", "--no-color", "--unified=3",
                 "--relative", "HEAD", "--", ".",
             )
             if sha256_bytes(resulting) != patch_hash:
-                _git(snapshot.repository_root, "apply", "-R", *directory_args, str(patch_file))
+                _git(snapshot.repository_root, "apply", "-R", "--index", *directory_args, str(patch_file))
                 raise DevelopmentSecurityError("Applied source diff did not match the reviewed patch; rollback completed")
             return sha256_bytes(canonical({
                 "sourceRevision": snapshot.revision,
                 "patchHash": patch_hash,
                 "changedFiles": list(files),
                 "rollback": "git apply -R of the exact reviewed patch",
+            }).encode())
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
+def rollback_reviewed_patch(
+    snapshot: SourceSnapshot,
+    patch: bytes,
+    patch_hash: str,
+    allowed_paths: Iterable[str],
+    lock_path: str | Path,
+) -> str:
+    """Reverse only the exact reviewed patch, refusing to clobber later work."""
+    import fcntl
+
+    if sha256_bytes(patch) != patch_hash:
+        raise DevelopmentSecurityError("Reviewed development patch hash does not match")
+    files = validate_patch(patch, allowed_paths)
+    if _git(snapshot.repository_root, "rev-parse", "HEAD").decode().strip().lower() != snapshot.revision:
+        raise DevelopmentSecurityError("Registered source revision changed before rollback")
+    lock = Path(lock_path)
+    lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with lock.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        current = _git(
+            snapshot.source_root, "diff", "--cached", "--no-ext-diff", "--no-color", "--unified=3",
+            "--relative", "HEAD", "--", ".",
+        )
+        if sha256_bytes(current) != patch_hash:
+            raise DevelopmentSecurityError(
+                "Registered source no longer matches the exact applied patch; rollback refused"
+            )
+        unstaged = _git(
+            snapshot.source_root, "diff", "--no-ext-diff", "--no-color", "--relative", "--", ".",
+        )
+        untracked = _git(
+            snapshot.source_root, "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
+        )
+        if unstaged or untracked:
+            raise DevelopmentSecurityError(
+                "Registered source has post-apply worktree changes; rollback refused"
+            )
+        temporary = Path(tempfile.mkdtemp(prefix="muster-reviewed-rollback-"))
+        patch_file = temporary / "reviewed.patch"
+        try:
+            patch_file.write_bytes(patch)
+            os.chmod(patch_file, stat.S_IRUSR | stat.S_IWUSR)
+            directory_args = [] if snapshot.repository_relative_root == "." else [f"--directory={snapshot.repository_relative_root}"]
+            _git(snapshot.repository_root, "apply", "-R", "--index", "--check", "--whitespace=error-all", *directory_args, str(patch_file))
+            _git(snapshot.repository_root, "apply", "-R", "--index", "--whitespace=error-all", *directory_args, str(patch_file))
+            remaining = _git(
+                snapshot.source_root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+            )
+            if remaining:
+                raise DevelopmentSecurityError("Rollback did not restore the reviewed clean source state")
+            return sha256_bytes(canonical({
+                "sourceRevision": snapshot.revision,
+                "patchHash": patch_hash,
+                "changedFiles": list(files),
+                "rollback": "verified exact reverse patch",
             }).encode())
         finally:
             shutil.rmtree(temporary, ignore_errors=True)

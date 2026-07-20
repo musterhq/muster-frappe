@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from uuid import uuid4
 
 try:
@@ -6,7 +7,7 @@ try:
     from frappe.tests.utils import FrappeTestCase
     from frappe.utils import now_datetime
 
-    from muster.api.native_builder import apply, preview
+    from muster.api.native_builder import _approval_time, apply, prepare_attended, preview
 except ModuleNotFoundError as exc:
     raise unittest.SkipTest("Frappe integration tests require an installed test site") from exc
 
@@ -87,6 +88,12 @@ class TestNativeBuilderAPI(FrappeTestCase):
             }
         ).insert()
 
+    def test_site_local_approval_time_is_serialized_with_timezone(self):
+        serialized = _approval_time(now_datetime())
+        parsed = datetime.fromisoformat(serialized)
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertLess(abs((datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()), 10)
+
     def test_preview_uses_live_actor_and_creates_no_native_effect(self):
         self._grant_preview()
         result = preview(self._intent())
@@ -97,6 +104,12 @@ class TestNativeBuilderAPI(FrappeTestCase):
                 "Custom Field", f"Muster Mission-muster_test_{self.suffix}"
             )
         )
+        attended = prepare_attended(result["change_set"], confirmed=1)
+        self.assertEqual(attended["artifact_kind"], "custom_field")
+        self.assertEqual(attended["doctype"], "Custom Field")
+        self.assertFalse(attended["apply_authorized"])
+        self.assertFalse(attended["executed"])
+        self.assertIn("fieldname", {row["fieldname"] for row in attended["fields"]})
         with self.assertRaises(frappe.PermissionError):
             apply(result["change_set"])
         self.assertFalse(

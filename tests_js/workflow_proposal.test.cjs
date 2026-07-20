@@ -26,11 +26,13 @@ function loadUI({user = "operator@example.test", roles = ["Muster Operator"]} = 
     msgprint() {},
     async call(options) {
       calls.push(options);
+      if (options.method === "muster.api.mission.prepare_attended_preview") return {message: {proposal: options.args.proposal, doctype: "Customer"}};
       return {message: {mission: "MST-MSN-1"}};
     },
     set_route(...parts) { routes.push(parts); },
   };
-  const window = {};
+  const attended = [];
+  const window = {musterSurfaceAdapters: {async start(receipt) { attended.push(receipt); }}};
   const context = {window, frappe, __: String, console};
   vm.runInNewContext(
     fs.readFileSync(
@@ -39,7 +41,7 @@ function loadUI({user = "operator@example.test", roles = ["Muster Operator"]} = 
     ),
     context,
   );
-  return {ui: window.MusterWorkflowProposalUI, handlers, dialogs, calls, routes};
+  return {ui: window.MusterWorkflowProposalUI, handlers, dialogs, calls, routes, attended};
 }
 
 function form(overrides = {}) {
@@ -49,10 +51,63 @@ function form(overrides = {}) {
       requested_by: "operator@example.test",
       published_workflow: "Reviewed workflow",
       published_version: "Reviewed workflow-v1",
+      compiled_graph_json: JSON.stringify({nodes: [{executionIntent: {surface: "browser", plan: {attendedCrud: {operation: "create"}}}}]}),
       ...overrides,
     },
   };
 }
+
+test("offers attended preview only to the requester with one bounded CRUD plan", () => {
+  const {ui} = loadUI();
+  assert.equal(ui.canPreviewAttendedProposal(form({status: "Proposed"})), true);
+  assert.equal(ui.canPreviewAttendedProposal(form({status: "Rejected"})), false);
+  assert.equal(ui.canPreviewAttendedProposal(form({requested_by: "another@example.test"})), false);
+  assert.equal(ui.canPreviewAttendedProposal(form({compiled_graph_json: "{}"})), false);
+  assert.equal(ui.canPreviewAttendedProposal(form({status: "Approved", compiled_graph_json: JSON.stringify({nodes: [{executionIntent: {surface: "browser", plan: {attendedCrud: {operation: "delete"}}}}]})})), true);
+});
+
+test("destructive approval UI requires a different dedicated checker", () => {
+  const deleteGraph = JSON.stringify({nodes: [{executionIntent: {surface: "browser", plan: {attendedCrud: {operation: "delete", doctype: "Customer", record_name: "ACME"}}}}]});
+  const maker = loadUI({user: "maker@example.test", roles: ["Muster Approver"]}).ui;
+  assert.equal(maker.canApproveProposal(form({status: "Proposed", requested_by: "maker@example.test", compiled_graph_json: deleteGraph})), false);
+  const manager = loadUI({user: "checker@example.test", roles: ["Muster Automation Manager"]}).ui;
+  assert.equal(manager.canApproveProposal(form({status: "Proposed", requested_by: "maker@example.test", compiled_graph_json: deleteGraph})), false);
+  const checker = loadUI({user: "checker@example.test", roles: ["Muster Approver"]}).ui;
+  assert.equal(checker.canApproveProposal(form({status: "Proposed", requested_by: "maker@example.test", compiled_graph_json: deleteGraph})), true);
+  assert.equal(checker.attendedTarget(form({compiled_graph_json: deleteGraph})).doctype, "Customer");
+  assert.equal(checker.attendedTarget(form({compiled_graph_json: deleteGraph})).recordName, "ACME");
+  assert.equal(checker.attendedTarget(form({compiled_graph_json: deleteGraph.replace("ACME", "bad\\nname")})), null);
+});
+
+test("exact-record update approval UI requires a different reviewer", () => {
+  const updateGraph = JSON.stringify({nodes: [{executionIntent: {surface: "browser", plan: {attendedCrud: {operation: "update", doctype: "Customer", record_name: "ACME"}}}}]});
+  const maker = loadUI({user: "maker@example.test", roles: ["Muster Automation Manager"]}).ui;
+  const checker = loadUI({user: "checker@example.test", roles: ["Muster Automation Manager"]}).ui;
+  assert.equal(maker.canApproveProposal(form({status: "Proposed", requested_by: "maker@example.test", compiled_graph_json: updateGraph})), false);
+  assert.equal(checker.canApproveProposal(form({status: "Proposed", requested_by: "maker@example.test", compiled_graph_json: updateGraph})), true);
+});
+
+test("delete preview copy promises exact-record one-time native deletion", () => {
+  const {ui, dialogs} = loadUI();
+  ui.previewInDesk(form({
+    name: "MST-WFP-DELETE", status: "Approved",
+    compiled_graph_json: JSON.stringify({nodes: [{executionIntent: {surface: "browser", plan: {attendedCrud: {operation: "delete"}}}}]}),
+  }));
+  assert.match(dialogs[0].options.title, /destructive review/i);
+  assert.match(dialogs[0].options.fields[0].options, /one short-lived attempt/i);
+  assert.match(dialogs[0].options.fields[0].options, /independent approval/i);
+});
+
+test("opens attended work through a confirmed non-saving server projection", async () => {
+  const {ui, dialogs, calls, attended} = loadUI();
+  ui.previewInDesk(form({name: "MST-WFP-ATTENDED", status: "Proposed"}));
+  assert.equal(dialogs.length, 1);
+  await dialogs[0].options.primary_action();
+  assert.equal(calls[0].method, "muster.api.mission.prepare_attended_preview");
+  assert.equal(calls[0].args.confirmed, 1);
+  assert.equal(calls[0].args.proposal, "MST-WFP-ATTENDED");
+  assert.deepEqual(attended, [{proposal: "MST-WFP-ATTENDED", doctype: "Customer"}]);
+});
 
 test("offers Start only to the original mission-capable requester", () => {
   const {ui} = loadUI();

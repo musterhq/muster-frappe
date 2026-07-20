@@ -10,11 +10,18 @@ from frappe.utils import now_datetime
 
 from muster.automation.models import NativeChange, Plan, canonical_json, digest
 from muster.change_ir.security import permission_epoch, schema_revision
+from muster.automation.source_provenance import validate_bound_source
+from muster.orchestration.source_ingestion import ingest_frappe_file
 
 
 def _json_value(value: Any) -> Any:
     """Convert Frappe child rows/dates to the same plain values used in a manifest."""
     return json.loads(frappe.as_json(value))
+
+
+def _same_persisted_plan(persisted: Any, current: Mapping[str, Any]) -> bool:
+    """Compare a JSON round-tripped plan without weakening exact matching."""
+    return isinstance(persisted, Mapping) and canonical_json(persisted) == canonical_json(current)
 
 
 class FrappeNativeBackend:
@@ -52,8 +59,16 @@ class FrappeNativeBackend:
         payload = dict(values)
         payload.pop("doctype", None)
         payload.pop("modified", None)
-        payload.setdefault("name", name)
-        return frappe.get_doc({"doctype": doctype, **payload}).insert().name
+        # Native plans bind approval, receipts, and rollback to an exact target
+        # name.  Frappe's insert lifecycle calls ``set_new_name`` even when a
+        # payload contains ``name``; DocTypes without Prompt autoname (notably
+        # Web Page in v16) can therefore replace the reviewed name with a hash.
+        # Mark the explicitly reviewed name as already assigned so lifecycle
+        # hooks still run without letting autoname silently change the target.
+        payload["name"] = name
+        doc = frappe.get_doc({"doctype": doctype, **payload})
+        doc.flags.name_set = True
+        return doc.insert().name
 
     def update(self, doctype: str, name: str, values: Mapping[str, Any]) -> None:
         payload = dict(values)
@@ -101,6 +116,13 @@ class FrappeNativeBackend:
         return None
 
     def validate_definition(self, definition, change_set) -> None:
+        if definition.doctype == "Server Script" and not bool(
+            frappe.conf.get("server_script_enabled", False)
+        ):
+            frappe.throw(
+                "Server Scripts are disabled for this site; use reviewed app hooks/code or obtain an explicit administrator configuration change",
+                frappe.ValidationError,
+            )
         if definition.doctype != "Muster Artifact":
             return
         file_url = definition.values["file"]
@@ -133,6 +155,14 @@ class FrappeNativeBackend:
             frappe.throw("office artifact SHA-256 does not match the private File",
                          frappe.ValidationError)
 
+    def validate_change_set_source(self, change_set) -> None:
+        if not change_set.source_evidence:
+            return
+        evidence = ingest_frappe_file(
+            change_set.source_evidence.file_id, user=change_set.actor
+        )
+        validate_bound_source(change_set, evidence)
+
     def begin_execution(self, plan: Plan) -> str:
         existing = frappe.get_all(
             "Muster Change Set",
@@ -144,7 +174,12 @@ class FrappeNativeBackend:
         if existing:
             doc = frappe.get_doc("Muster Change Set", existing[0].name)
             persisted = json.loads(doc.evidence_json or "{}")
-            if persisted.get("kind") != "native_artifact_plan" or persisted.get("plan") != plan.as_dict():
+            # Evidence is stored as JSON, so tuple-valued immutable model fields
+            # return as lists after the database round trip. Compare canonical
+            # JSON instead of Python container identity while still requiring an
+            # exact, byte-stable plan match.
+            if (persisted.get("kind") != "native_artifact_plan" or
+                    not _same_persisted_plan(persisted.get("plan"), plan.as_dict())):
                 frappe.throw("persisted native artifact plan evidence does not match",
                              frappe.ValidationError)
             doc.db_set("status", "Applying", update_modified=True)
@@ -167,12 +202,19 @@ class FrappeNativeBackend:
     def _insert_plan(self, plan: Plan, status: str) -> str:
         risk = {"None": "Low", "Standard": "Moderate", "Sensitive": "High",
                 "Privileged Code": "Critical", "Destructive": "Critical"}[plan.approval_class]
+        source = plan.source.source_evidence
         doc = frappe.get_doc({
             "doctype": "Muster Change Set", "mission": plan.source.mission,
             "status": status, "risk_class": risk, "approval_class": plan.approval_class,
             "target_site": plan.source.target_site, "actor": plan.source.actor,
             "permission_epoch": permission_epoch(plan.source.actor),
             "schema_revision": schema_revision(), "plan_hash": plan.plan_hash,
+            **({
+                "source_file": source.file_id,
+                "source_file_hash": source.file_hash,
+                "source_requirements_hash": source.requirements_hash,
+                "source_evidence_hash": source.evidence_hash,
+            } if source else {}),
             "evidence_json": canonical_json({"kind": "native_artifact_plan", "plan": plan.as_dict()}),
             "operations": [{
                 "operation_id": change.artifact_id, "operation_type": f"native_{change.kind}",
@@ -182,8 +224,11 @@ class FrappeNativeBackend:
                 "after_json": canonical_json(change.after),
                 "concurrency_token": change.before_revision,
                 "idempotency_key": change.idempotency_key,
+                "source_citations_json": canonical_json([
+                    citation.as_dict() for citation in plan.source.artifacts[index].source_citations
+                ]) if plan.source.artifacts[index].source_citations else None,
                 "postcondition_json": canonical_json({"after_hash": digest(change.after)}),
-            } for change in plan.changes],
+            } for index, change in enumerate(plan.changes)],
         }).insert()
         return doc.name
 

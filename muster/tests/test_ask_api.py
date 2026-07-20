@@ -7,7 +7,8 @@ try:
     import frappe
     from frappe.tests.utils import FrappeTestCase
 
-    from muster.api.ask import _prompt_form_doctype, _require_user, accept_handoff, poll, submit
+    from muster.api.ask import _handoffs, _presentable_answer, _presentable_tool_calls, _prompt_form_doctype, _require_user, _issue_clarification, _verified_exact_record, accept_handoff, poll, submit
+    from muster.api.catalog import _commands, _named_runtime_items, _personas
 except ModuleNotFoundError as exc:
     raise unittest.SkipTest("Frappe integration tests require an installed test site") from exc
 
@@ -90,6 +91,7 @@ class TestAskAPI(FrappeTestCase):
         gateway.request.return_value = {
             "runId": run_id,
             "status": "completed",
+            "partialText": "I will inspect the control plane and call an internal action.",
             "reasoningText": "private provider reasoning",
             "reply": {
                 "text": "Here is the permitted answer.",
@@ -106,8 +108,64 @@ class TestAskAPI(FrappeTestCase):
         self.assertEqual(result["answer"], "Here is the permitted answer.")
         self.assertNotIn("reasoningText", result)
         self.assertNotIn("reasoning_text", result)
+        self.assertNotIn("partialText", result)
+        self.assertNotIn("partial_text", result)
         self.assertEqual([row["name"] for row in result["artifacts"]], ["safe.pdf"])
         self.assertNotIn("path", result["artifacts"][0])
+
+    def test_tool_call_presentation_drops_backend_diagnostics(self):
+        calls = _presentable_tool_calls([
+            {
+                "kind": "mcp", "status": "completed", "label": "Customer form",
+                "summary": "Checked permitted fields.",
+                "details": {
+                    "purpose": "Prepare the form", "scope": "Customer",
+                    "outcome": "Ready", "rawArguments": {"token": "secret"},
+                    "stack": "/srv/private/runtime.py:10",
+                },
+            },
+            {
+                "kind": "tool", "status": "failed", "label": "provider backend trace",
+                "summary": "model call failed at /srv/private with sha256 " + "a" * 64,
+                "details": {"outcome": "stack trace at localhost"},
+            },
+            {"kind": "provider_trace", "status": "completed", "label": "Trace", "summary": "internal"},
+        ])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(set(calls[0]["details"]), {"purpose", "scope", "outcome"})
+        self.assertEqual(calls[1]["label"], "Muster step")
+        self.assertEqual(calls[1]["summary"], "This step could not be completed. Nothing was changed.")
+        self.assertNotIn("details", calls[1])
+        self.assertNotIn("rawArguments", str(calls))
+        self.assertNotIn("stack", str(calls))
+        self.assertNotIn("sha256", str(calls))
+
+    def test_answer_presentation_removes_runtime_diagnostics(self):
+        answer = _presentable_answer(
+            "Three invoices are overdue.\n\n"
+            "Provider: private-model\nRequest ID: req-123\n"
+            "```json\n{\"backend\": \"http://localhost:9000\", \"tool_calls\": []}\n```\n"
+            "Review them before sending reminders."
+        )
+        self.assertEqual(answer, "Three invoices are overdue.\n\nReview them before sending reminders.")
+        self.assertNotIn("Provider", answer)
+        self.assertNotIn("localhost", answer)
+
+    def test_palette_catalog_is_permission_filtered_and_bounded(self):
+        remote = [
+            {"name": "help", "label": "Help", "description": "Available help", "surfaces": ["*"]},
+            {"name": "audit", "label": "Audit", "description": "Sensitive audit", "surfaces": ["*"], "minimum_role": "manager"},
+            {"name": "pair", "label": "Pair", "description": "Wrong surface", "surfaces": ["telegram"]},
+        ]
+        viewer = _commands(remote, {"Muster Viewer"})
+        self.assertEqual([row["id"] for row in viewer], ["help"])
+        manager = _commands(remote, {"Muster Automation Manager"})
+        self.assertEqual([row["id"] for row in manager], ["help", "audit"])
+        skills = _named_runtime_items([{"name": "pdf", "label": "PDF", "description": "Build PDFs", "transport": {"secret": "hidden"}}], "skill")
+        self.assertEqual(skills, [{"kind": "skill", "id": "pdf", "label": "PDF", "description": "Available to governed workflows; access is checked again when used", "token": "@skill:pdf"}])
+        agents = _personas({"native": {"label": "General", "description": "runtime using provider secret-provider"}})
+        self.assertEqual(agents[0]["description"], "Use this governed Muster agent")
+        self.assertNotIn("provider", str(agents).lower())
 
     def test_live_aggregate_gets_fresh_filtered_evidence_before_answer_provider(self):
         gateway = Mock()
@@ -175,8 +233,14 @@ class TestAskAPI(FrappeTestCase):
             gateway.request.side_effect = request
             result = submit("Create a customer and show every Desk step.", "desk-session-3", {"route": "/desk"}, "ask-effect-offer")
         self.assertEqual(result["status"], "queued")
-        self.assertEqual({row["kind"] for row in result["handoffs"]}, {"governed_change", "attended_browser"})
+        self.assertEqual([row["kind"] for row in result["handoffs"]], ["attended_browser"])
+        self.assertEqual(result["handoffs"][0]["label"], "Open the form and review changes")
         self.assertTrue(all(row["requires"] == "explicit_confirmation" for row in result["handoffs"]))
+        answer_context = gateway.request.call_args_list[-1].kwargs["payload"]["context"]
+        self.assertEqual(answer_context["fastReply"], {
+            "text": "I can prepare this for review. Nothing has run or changed yet. "
+                    "Choose a next step below to review the proposed work before anything runs."
+        })
         turn = frappe.get_doc("Muster Ask Turn", result["turn_id"])
         self.assertEqual(turn.status, "Offered")
         self.assertFalse(turn.workflow_proposal)
@@ -265,6 +329,255 @@ class TestAskAPI(FrappeTestCase):
         self.assertFalse(result["executed"])
         self.assertEqual(result["proposal"], "MST-WFP-TEST")
         request.assert_called_once()
+
+    def test_attended_handoff_returns_one_clarification_without_accepting_or_linking(self):
+        frappe.set_user(self.user)
+        prompt = "Update the customer"
+        digest = __import__("hashlib").sha256
+        turn = frappe.get_doc({
+            "doctype": "Muster Ask Turn", "requested_by": self.user,
+            "conversation_id": "desk-clarify", "request_id": f"clarify-{uuid4().hex}", "status": "Offered",
+            "expires_at": frappe.utils.add_to_date(frappe.utils.now_datetime(), hours=1),
+            "prompt_secret": prompt, "prompt_hash": digest(prompt.encode()).hexdigest(),
+            "scope_json": "{}", "scope_hash": digest(b"{}").hexdigest(),
+            "outcomes_json": '["attended_browser"]',
+            "handoffs_json": '[{"id":"handoff-clarify","kind":"attended_browser","label":"Open form","state":"offered","requires":"explicit_confirmation"}]',
+        }).insert()
+        with (
+            patch("muster.api.ask._require_post"),
+            patch("muster.orchestration.workflow_proposal.request_workflow_proposal", return_value={
+                "status": "clarification", "reason": "What value should I use for First Name?",
+                "replayed": False, "executed": False,
+            }),
+        ):
+            result = accept_handoff(turn.name, "handoff-clarify", 1, "accept-clarify")
+        self.assertEqual(result["turn_id"], turn.name)
+        self.assertEqual(result["handoff_id"], "handoff-clarify")
+        self.assertEqual(result["status"], "clarification")
+        self.assertEqual(result["reason"], "What value should I use for First Name?")
+        self.assertFalse(result["replayed"])
+        self.assertFalse(result["executed"])
+        self.assertEqual(result["continuation"]["conversation_id"], "desk-clarify")
+        self.assertEqual(result["continuation"]["prompt_hash"], turn.prompt_hash)
+        self.assertEqual(result["continuation"]["bound_scope"], {})
+        self.assertGreaterEqual(len(result["continuation"]["token"]), 32)
+        turn.reload()
+        self.assertEqual(turn.status, "Offered")
+        self.assertFalse(turn.workflow_proposal)
+        self.assertFalse(turn.clarification_consumed_at)
+
+        gateway = Mock()
+        acknowledgement = {
+            "runId": "msg_66666666-6666-4666-8666-666666666666",
+            "pollUrl": "/v1/integrations/frappe/messages/runs/msg_66666666-6666-4666-8666-666666666666",
+            "status": "queued", "replayed": False,
+        }
+        gateway.request.side_effect = lambda method, path, **kwargs: ({
+            "schemaVersion": 1, "requestId": kwargs["payload"]["requestId"],
+            "status": "classified", "intent": {
+                "schemaVersion": 1, "requestId": kwargs["payload"]["requestId"],
+                "requestedOutcomes": ["attended_browser"], "requiresClarification": False,
+            },
+        } if path.endswith("/ask-intents") else acknowledgement)
+        with (
+            patch("muster.api.ask._require_post"),
+            patch("muster.api.ask._client_for_user", return_value=(gateway, {"X-Signed": "yes"}, self.binding)),
+        ):
+            clarified = submit(
+                "Aarav Rain Proof", "desk-clarify", {}, f"clarify-answer-{uuid4().hex}",
+                turn.name, "handoff-clarify", result["continuation"]["token"], turn.prompt_hash,
+            )
+        self.assertEqual(
+            clarified["merged_objective"],
+            "Update the customer\n\nClarification requested by Muster:\n"
+            "What value should I use for First Name?\n\n"
+            "User's answer to that clarification:\nAarav Rain Proof",
+        )
+        self.assertTrue(any(call.args[1].endswith("/ask-intents") for call in gateway.request.call_args_list))
+
+    def test_clarification_reply_is_lineage_bound_transparent_and_single_use(self):
+        frappe.set_user(self.user)
+        prompt = "Update the customer"
+        digest = __import__("hashlib").sha256
+        scope = {"source": "desk-dock", "doctype": "Customer", "scope_mode": "context"}
+        scope_json = __import__("json").dumps(scope, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        parent_request_key = f"lineage-{uuid4().hex}"
+        parent_intent_request_id = f"intent-{digest(f'{self.user}:desk-lineage:{parent_request_key}'.encode()).hexdigest()[:32]}"
+        parent_handoffs = _handoffs(["attended_browser"], parent_intent_request_id)
+        parent_handoff_id = "intent"
+        turn = frappe.get_doc({
+            "doctype": "Muster Ask Turn", "requested_by": self.user,
+            "conversation_id": "desk-lineage", "request_id": parent_request_key, "status": "Offered",
+            "expires_at": frappe.utils.add_to_date(frappe.utils.now_datetime(), hours=1),
+            "prompt_secret": prompt, "prompt_hash": digest(prompt.encode()).hexdigest(),
+            "scope_json": scope_json, "scope_hash": digest(scope_json.encode()).hexdigest(),
+            "outcomes_json": '["attended_browser"]',
+            "handoffs_json": __import__("json").dumps(parent_handoffs, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        }).insert()
+        clarification = _issue_clarification(
+            turn, parent_handoff_id, "Which exact Customer record should I update?",
+        )
+        turn.reload()
+        continuation = clarification
+
+        with patch("muster.api.ask._require_post"):
+            with self.assertRaises(frappe.PermissionError):
+                submit("CUST-0001", "another-conversation", scope, "wrong-conversation", turn.name, parent_handoff_id, continuation["token"], turn.prompt_hash)
+            with self.assertRaises(frappe.ValidationError):
+                submit("CUST-0001", "desk-lineage", {**scope, "docname": "CUST-OTHER"}, "wrong-scope", turn.name, parent_handoff_id, continuation["token"], turn.prompt_hash)
+            with self.assertRaises(frappe.ValidationError):
+                submit("CUST-0001", "desk-lineage", scope, "wrong-token", turn.name, parent_handoff_id, "x" * 43, turn.prompt_hash)
+            turn.db_set("clarification_expires_at", frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=-1), update_modified=False)
+            with self.assertRaises(frappe.ValidationError):
+                submit("CUST-0001", "desk-lineage", scope, "expired-token", turn.name, parent_handoff_id, continuation["token"], turn.prompt_hash)
+            turn.db_set("clarification_expires_at", frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=15), update_modified=False)
+            frappe.set_user("Administrator")
+            with self.assertRaises(frappe.PermissionError):
+                submit("CUST-0001", "desk-lineage", scope, "wrong-user", turn.name, parent_handoff_id, continuation["token"], turn.prompt_hash)
+            frappe.set_user(self.user)
+
+        gateway = Mock()
+        acknowledgement = {
+            "runId": "msg_77777777-7777-4777-8777-777777777777",
+            "pollUrl": "/v1/integrations/frappe/messages/runs/msg_77777777-7777-4777-8777-777777777777",
+            "status": "queued", "replayed": False,
+        }
+        def request(method, path, **kwargs):
+            if path.endswith("/ask-intents"):
+                request_id = kwargs["payload"]["requestId"]
+                return {"schemaVersion": 1, "requestId": request_id, "status": "classified", "intent": {
+                    "schemaVersion": 1, "requestId": request_id, "requestedOutcomes": ["attended_browser"], "requiresClarification": False,
+                }}
+            return acknowledgement
+        gateway.request.side_effect = request
+        with (
+            patch("muster.api.ask._require_post"),
+            patch("muster.api.ask._client_for_user", return_value=(gateway, {"X-Signed": "yes"}, self.binding)),
+            patch.object(frappe.db, "exists", side_effect=lambda doctype, name=None: (doctype == "DocType" and name == "Customer") or (doctype == "Customer" and name == "CUST-0001")),
+            patch.object(frappe, "has_permission", return_value=True),
+        ):
+            result = submit(
+                "CUST-0001", "desk-lineage", scope, "clarified-request",
+                turn.name, parent_handoff_id, continuation["token"], turn.prompt_hash,
+            )
+        self.assertEqual(result["merged_objective"], "Update the customer\n\nClarification supplied by the user:\nCUST-0001")
+        child = frappe.get_doc("Muster Ask Turn", result["turn_id"])
+        self.assertEqual(child.parent_ask_turn, turn.name)
+        self.assertEqual(child.parent_handoff_id, parent_handoff_id)
+        self.assertEqual(child.clarification_reply_hash, digest(b"CUST-0001").hexdigest())
+        self.assertEqual(child.verified_target_doctype, "Customer")
+        self.assertEqual(child.verified_target_name, "CUST-0001")
+        self.assertEqual(child.verified_target_action, "update")
+        self.assertFalse(any(call.args[1].endswith("/ask-intents") for call in gateway.request.call_args_list))
+        child_handoff = __import__("json").loads(child.handoffs_json)[0]["id"]
+        with (
+            patch("muster.api.ask._require_post"),
+            patch.object(frappe.db, "exists", side_effect=lambda doctype, name=None: (doctype == "DocType" and name == "Customer") or (doctype == "Customer" and name == "CUST-0001")),
+            patch.object(frappe, "has_permission", return_value=True),
+            patch("muster.orchestration.workflow_proposal.request_workflow_proposal", return_value={
+                "proposal": "MST-WFP-VERIFIED", "status": "Proposed", "replayed": False, "executed": False,
+            }) as request_proposal,
+        ):
+            accepted = accept_handoff(child.name, child_handoff, 1, "accept-verified-child")
+        self.assertEqual(accepted["proposal"], "MST-WFP-VERIFIED")
+        self.assertEqual(request_proposal.call_args.kwargs["verified_record_identity"], {
+            "doctype": "Customer", "record_name": "CUST-0001", "action": "update",
+            "evidence_hash": child.verified_target_evidence_hash,
+        })
+        turn.reload()
+        self.assertEqual(turn.clarification_child_turn, child.name)
+        self.assertTrue(turn.clarification_consumed_at)
+        self.assertFalse(turn.workflow_proposal)
+        with (
+            patch("muster.api.ask._require_post"),
+            patch("muster.api.ask._client_for_user", return_value=(gateway, {"X-Signed": "yes"}, self.binding)),
+            patch.object(frappe.db, "exists", side_effect=lambda doctype, name=None: (doctype == "DocType" and name == "Customer") or (doctype == "Customer" and name == "CUST-0001")),
+            patch.object(frappe, "has_permission", return_value=True),
+        ):
+            replay = submit(
+                "CUST-0001", "desk-lineage", scope, "clarified-request",
+                turn.name, parent_handoff_id, continuation["token"], turn.prompt_hash,
+            )
+        self.assertEqual(replay["turn_id"], child.name)
+        self.assertEqual(replay["merged_objective"], result["merged_objective"])
+        turn.db_set("outcomes_json", '["answer"]', update_modified=False)
+        with (
+            patch("muster.api.ask._require_post"),
+            patch.object(frappe.db, "exists", return_value=True),
+            patch.object(frappe, "has_permission", return_value=True),
+        ):
+            with self.assertRaisesRegex(frappe.ValidationError, "parent Ask routing evidence"):
+                submit(
+                    "CUST-0001", "desk-lineage", scope, "clarified-request",
+                    turn.name, parent_handoff_id, continuation["token"], turn.prompt_hash,
+                )
+        turn.db_set("outcomes_json", '["attended_browser"]', update_modified=False)
+        with patch("muster.api.ask._require_post"):
+            with self.assertRaises(frappe.ValidationError):
+                submit(
+                    "CUST-9999", "desk-lineage", scope, "replay-injection",
+                    turn.name, parent_handoff_id, continuation["token"], turn.prompt_hash,
+                )
+
+    def test_exact_record_resolver_supports_delete_and_fails_closed(self):
+        frappe.set_user(self.user)
+        digest = __import__("hashlib").sha256
+        scope = {"doctype": "Customer", "scope_mode": "context"}
+        scope_json = __import__("json").dumps(scope, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+        def parent(prompt="Delete the Customer", documents=None):
+            value = dict(scope)
+            if documents is not None:
+                value["documents"] = documents
+            encoded = __import__("json").dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            return frappe.get_doc({
+                "doctype": "Muster Ask Turn", "requested_by": self.user,
+                "conversation_id": "desk-delete-resolver", "request_id": f"delete-resolver-{uuid4().hex}", "status": "Offered",
+                "expires_at": frappe.utils.add_to_date(frappe.utils.now_datetime(), hours=1),
+                "prompt_secret": prompt, "prompt_hash": digest(prompt.encode()).hexdigest(),
+                "scope_json": encoded, "scope_hash": digest(encoded.encode()).hexdigest(),
+                "outcomes_json": '["attended_browser"]',
+                "handoffs_json": '[{"id":"handoff-delete","kind":"attended_browser","label":"Open form","state":"offered","requires":"explicit_confirmation"}]',
+            }).insert()
+
+        turn = parent()
+        receipt = _issue_clarification(turn, "handoff-delete", "Which exact Customer record should I delete?")
+        turn.reload()
+        self.assertEqual(receipt["handoff_id"], "handoff-delete")
+        self.assertEqual(turn.clarification_kind, "exact_record")
+        with (
+            patch.object(frappe.db, "exists", side_effect=lambda doctype, name=None: (doctype == "DocType" and name == "Customer") or (doctype == "Customer" and name == "ACME")),
+            patch.object(frappe, "has_permission", return_value=True) as permission,
+        ):
+            verified = _verified_exact_record(turn, "ACME", self.user, "desk-delete-resolver")
+        self.assertEqual(verified["verified_target_action"], "delete")
+        self.assertEqual(verified["verified_target_name"], "ACME")
+        permission.assert_any_call("Customer", "read", doc="ACME", user=self.user)
+        permission.assert_any_call("Customer", "delete", doc="ACME", user=self.user)
+
+        with patch.object(frappe.db, "exists", return_value=False):
+            with self.assertRaises(frappe.PermissionError):
+                _verified_exact_record(turn, "MISSING", self.user, "desk-delete-resolver")
+        with self.assertRaisesRegex(frappe.ValidationError, "one exact record ID"):
+            _verified_exact_record(turn, "ACME\nBETA", self.user, "desk-delete-resolver")
+        with patch.object(frappe.db, "exists", return_value=True), patch.object(frappe, "has_permission", return_value=False):
+            with self.assertRaises(frappe.PermissionError):
+                _verified_exact_record(turn, "PRIVATE", self.user, "desk-delete-resolver")
+
+        cross = parent(documents=[
+            {"doctype": "Customer", "name": "ACME"},
+            {"doctype": "Supplier", "name": "SUP-1"},
+        ])
+        _issue_clarification(cross, "handoff-delete", "Which exact Customer record should I delete?")
+        cross.reload()
+        with self.assertRaisesRegex(frappe.ValidationError, "one permitted record type"):
+            _verified_exact_record(cross, "ACME", self.user, "desk-delete-resolver")
+
+        ambiguous = parent(prompt="Update or delete the Customer")
+        _issue_clarification(ambiguous, "handoff-delete", "Which exact Customer record should I delete?")
+        ambiguous.reload()
+        self.assertEqual(ambiguous.clarification_kind, "missing_detail")
+        self.assertIsNone(_verified_exact_record(ambiguous, "ACME", self.user, "desk-delete-resolver"))
 
     def test_development_handoff_creates_only_source_bound_development_proposal(self):
         frappe.set_user(self.user)

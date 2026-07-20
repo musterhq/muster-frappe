@@ -17,6 +17,9 @@ class MusterAskTurn(Document):
             for field in (
                 "requested_by", "conversation_id", "request_id", "prompt_hash",
                 "scope_json", "scope_hash", "outcomes_json", "handoffs_json", "clarification",
+                "parent_ask_turn", "parent_handoff_id", "clarification_reply_hash",
+                "verified_target_doctype", "verified_target_name", "verified_target_action",
+                "verified_target_at", "verified_target_evidence_hash",
             )
         ):
             frappe.throw("The admitted Ask request and handoffs are immutable")
@@ -40,6 +43,30 @@ class MusterAskTurn(Document):
                 frappe.throw("Ask turn handoff evidence is invalid")
         if self.clarification and len(self.clarification) > 500:
             frappe.throw("Ask turn clarification is invalid")
+        lineage = [self.parent_ask_turn, self.parent_handoff_id, self.clarification_reply_hash]
+        if any(lineage) and not all(lineage):
+            frappe.throw("Ask turn clarification lineage is incomplete")
+        if self.parent_ask_turn == self.name:
+            frappe.throw("Ask turn cannot clarify itself")
+        if self.clarification_reply_hash and (
+            len(self.clarification_reply_hash) != 64
+            or any(char not in "0123456789abcdef" for char in self.clarification_reply_hash)
+        ):
+            frappe.throw("Ask turn clarification reply evidence is invalid")
+        verified = [
+            self.verified_target_doctype, self.verified_target_name,
+            self.verified_target_action, self.verified_target_at,
+            self.verified_target_evidence_hash,
+        ]
+        if any(verified) and (not all(verified) or not all(lineage)):
+            frappe.throw("Ask turn verified target evidence is incomplete")
+        if self.verified_target_action and self.verified_target_action not in {"update", "delete"}:
+            frappe.throw("Ask turn verified target action is invalid")
+        if self.verified_target_evidence_hash and (
+            len(self.verified_target_evidence_hash) != 64
+            or any(char not in "0123456789abcdef" for char in self.verified_target_evidence_hash)
+        ):
+            frappe.throw("Ask turn verified target evidence hash is invalid")
         canonical_scope = json.dumps(scope, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         if sha256(canonical_scope.encode()).hexdigest() != self.scope_hash:
             frappe.throw("Ask turn scope evidence does not match")

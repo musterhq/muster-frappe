@@ -98,8 +98,9 @@ def _native_plan(intent: dict[str, Any], mission, binding, node_id: str) -> tupl
 
     actor = mission.requested_by
     static = intent["operation"]["intent"]
-    if set(static) - {"schema_version", "artifacts"} or not isinstance(static.get("artifacts"), list):
-        raise frappe.ValidationError(_("Native effect intent must contain only schema_version and artifacts"))
+    if (set(static) - {"schema_version", "artifacts", "source_file"}
+            or not isinstance(static.get("artifacts"), list)):
+        raise frappe.ValidationError(_("Native effect intent contains unsupported source or artifact fields"))
     runtime_intent = {**static, "mission": mission.name}
     source = _source_from_intent(runtime_intent, actor)
     _check_control_permissions(source, create=True)
@@ -110,10 +111,16 @@ def _native_plan(intent: dict[str, Any], mission, binding, node_id: str) -> tupl
     expected_native_capability = {
         "custom_field": "artifact.custom_field.write",
         "property_setter": "artifact.property_setter.write",
+        "doctype": "artifact.doctype.write",
         "page": "artifact.page.write",
+        "workspace": "artifact.workspace.write",
         "report": "artifact.report.write",
+        "script_report": "artifact.report.script.write",
         "print_format": "artifact.print_format.write",
         "web_page": "artifact.web_page.write",
+        "web_form": "artifact.web_form.write",
+        "notification": "artifact.notification.write",
+        "assignment_rule": "artifact.assignment_rule.write",
     }[intent["operation"]["artifactType"]]
     if any(change.capability != expected_native_capability for change in native_plan.changes):
         raise frappe.PermissionError(_("Native builder capability does not match the reviewed effect"))

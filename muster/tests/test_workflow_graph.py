@@ -199,6 +199,30 @@ class TestWorkflowGraph(unittest.TestCase):
                 "requested_capabilities": ["frappe.record.update"], "effect_intent": intent,
             }))], "c" * 64)
 
+    def test_record_delete_intent_is_value_free_dual_control_and_identity_bound(self):
+        intent = {
+            "schemaVersion": 1, "capability": "frappe.record.delete",
+            "operation": {"kind": "record", "action": "delete", "doctype": "ToDo", "docname": "TODO-1"},
+            "postconditions": [{"path": "$.deleted", "operator": "equals", "expected": True}],
+            "approvalClass": "dual_control",
+        }
+        raw, _ = canonical_execution_manifest([node("delete", configuration_json=json.dumps({
+            "requested_capabilities": ["frappe.record.delete"], "effect_intent": intent,
+        }))], "d" * 64)
+        entry = json.loads(raw)["nodePlans"]["delete"]
+        self.assertEqual(entry["resourceScope"], {
+            "routes": [], "doctypes": ["ToDo"], "recordNames": ["TODO-1"], "fields": [],
+        })
+        for mutation in (
+            {**intent, "approvalClass": "single"},
+            {**intent, "operation": {**intent["operation"], "values": {"name": "smuggled"}}},
+            {**intent, "operation": {"kind": "record", "action": "delete", "doctype": "ToDo"}},
+        ):
+            with self.assertRaises(WorkflowGraphError):
+                canonical_execution_manifest([node("delete", configuration_json=json.dumps({
+                    "requested_capabilities": ["frappe.record.delete"], "effect_intent": mutation,
+                }))], "d" * 64)
+
     def test_static_native_effect_compiles_typed_diff_and_rejects_kind_or_code_escape(self):
         intent = {
             "schemaVersion": 1, "capability": "frappe.metadata.custom_field.create",
@@ -244,3 +268,76 @@ class TestWorkflowGraph(unittest.TestCase):
                 "requested_capabilities": ["frappe.metadata.print_format.create"],
                 "effect_intent": privileged,
             }))], "f" * 64)
+
+    def test_all_governed_customization_effects_use_the_typed_native_path(self):
+        surfaces = {
+            "frappe.metadata.doctype.create": "doctype",
+            "frappe.metadata.page.create": "page",
+            "frappe.metadata.workspace.create": "workspace",
+            "frappe.metadata.report.create": "query_report",
+            "frappe.metadata.script_report.create": "script_report",
+            "frappe.metadata.web_form.create": "web_form",
+            "frappe.automation.notification.create": "notification",
+            "frappe.automation.assignment_rule.create": "assignment_rule",
+            "frappe.metadata.client_script.create": "client_script",
+            "frappe.metadata.server_script.create": "server_script",
+            "frappe.metadata.email_template.create": "email_template",
+        }
+        for capability, kind in surfaces.items():
+            artifact_type = "report" if kind == "query_report" else kind
+            intent = {
+                "schemaVersion": 1, "capability": capability,
+                "operation": {"kind": "native_artifact", "artifactType": artifact_type,
+                              "intent": {"schema_version": "1.0", "artifacts": [{
+                                  "artifact_id": f"artifact-{kind}", "kind": kind,
+                                  "target_name": f"Disposable {kind}",
+                                  "idempotency_key": f"disposable-{kind}-v1", "values": {},
+                              }]}},
+                "postconditions": [
+                    {"path": "$.status", "operator": "equals", "expected": "Verified"},
+                    {"path": "$.verified", "operator": "equals", "expected": True},
+                ], "approvalClass": "dual_control",
+            }
+            raw, _ = canonical_execution_manifest([node(kind, configuration_json=json.dumps({
+                "requested_capabilities": [capability], "effect_intent": intent,
+            }))], "a" * 64)
+            self.assertEqual(
+                json.loads(raw)["nodePlans"][kind]["plan"]["operation"]["artifactType"],
+                artifact_type,
+            )
+            single = {**intent, "approvalClass": "single"}
+            with self.assertRaises(WorkflowGraphError):
+                canonical_execution_manifest([node(kind, configuration_json=json.dumps({
+                    "requested_capabilities": [capability], "effect_intent": single,
+                }))], "b" * 64)
+
+    def test_source_file_and_citation_selectors_are_bound_into_native_effect_manifest(self):
+        def intent(file_id="FILE-SOURCE-1", requirement="R001"):
+            return {
+                "schemaVersion": 1, "capability": "frappe.metadata.custom_field.create",
+                "operation": {"kind": "native_artifact", "artifactType": "custom_field",
+                              "intent": {"schema_version": "1.0", "source_file": file_id,
+                                         "artifacts": [{
+                                             "artifact_id": "source-field", "kind": "custom_field",
+                                             "target_name": "source_field", "target_doctype": "Customer",
+                                             "idempotency_key": "source-field-v1",
+                                             "source_citations": [requirement],
+                                             "values": {"label": "Source", "fieldtype": "Data"},
+                                         }]}},
+                "postconditions": [
+                    {"path": "$.status", "operator": "equals", "expected": "Verified"},
+                    {"path": "$.verified", "operator": "equals", "expected": True},
+                ], "approvalClass": "single",
+            }
+
+        raw, first_hash = canonical_execution_manifest([node("source", configuration_json=json.dumps({
+            "requested_capabilities": ["frappe.metadata.custom_field.create"],
+            "effect_intent": intent(),
+        }))], "c" * 64)
+        plan = json.loads(raw)["nodePlans"]["source"]["plan"]
+        self.assertEqual(plan["operation"]["intent"]["source_file"], "FILE-SOURCE-1")
+        _raw, changed_hash = canonical_execution_manifest([node("source", configuration_json=json.dumps({
+            "requested_capabilities": ["frappe.metadata.custom_field.create"],
+            "effect_intent": intent(requirement="R002"),
+        }))], "c" * 64)
+        self.assertNotEqual(first_hash, changed_hash)

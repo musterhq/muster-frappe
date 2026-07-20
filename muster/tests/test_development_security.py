@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from muster.orchestration.development import (
     apply_reviewed_patch,
     generate_reviewed_patch,
     run_offline_codex,
+    rollback_reviewed_patch,
     source_snapshot,
     validate_patch,
 )
@@ -66,6 +68,47 @@ class DevelopmentSecurityTest(unittest.TestCase):
         self.assertRegex(evidence, r"^[a-f0-9]{64}$")
         self.assertEqual((self.root / "muster" / "feature.py").read_text(), "VALUE = 3\n")
         self.assertTrue(git(self.root, "status", "--porcelain").strip())
+
+    def test_rollback_reverses_only_the_exact_applied_patch(self):
+        def runner(workspace: Path, _prompt: str) -> None:
+            (workspace / "muster" / "feature.py").write_text("VALUE = 7\n")
+
+        generated = generate_reviewed_patch(self.snapshot, "Change one value", self.allowed, runner)
+        lock = Path(self.temporary.name) / "rollback.lock"
+        apply_reviewed_patch(self.snapshot, generated.patch, generated.patch_hash, self.allowed, lock)
+        evidence = rollback_reviewed_patch(
+            self.snapshot, generated.patch, generated.patch_hash, self.allowed, lock,
+        )
+        self.assertRegex(evidence, r"^[a-f0-9]{64}$")
+        self.assertEqual((self.root / "muster" / "feature.py").read_text(), "VALUE = 1\n")
+        self.assertFalse(git(self.root, "status", "--porcelain").strip())
+
+    def test_rollback_refuses_post_apply_drift(self):
+        def runner(workspace: Path, _prompt: str) -> None:
+            (workspace / "muster" / "feature.py").write_text("VALUE = 8\n")
+
+        generated = generate_reviewed_patch(self.snapshot, "Change one value", self.allowed, runner)
+        lock = Path(self.temporary.name) / "rollback-drift.lock"
+        apply_reviewed_patch(self.snapshot, generated.patch, generated.patch_hash, self.allowed, lock)
+        (self.root / "muster" / "feature.py").write_text("human edit after apply\n")
+        with self.assertRaises(DevelopmentSecurityError):
+            rollback_reviewed_patch(
+                self.snapshot, generated.patch, generated.patch_hash, self.allowed, lock,
+            )
+        self.assertEqual((self.root / "muster" / "feature.py").read_text(), "human edit after apply\n")
+
+    def test_apply_and_rollback_cover_new_files(self):
+        def runner(workspace: Path, _prompt: str) -> None:
+            (workspace / "muster" / "new_api.py").write_text("VALUE = 'new'\n")
+
+        generated = generate_reviewed_patch(self.snapshot, "Add one API file", self.allowed, runner)
+        lock = Path(self.temporary.name) / "new-file.lock"
+        apply_reviewed_patch(self.snapshot, generated.patch, generated.patch_hash, self.allowed, lock)
+        self.assertEqual((self.root / "muster" / "new_api.py").read_text(), "VALUE = 'new'\n")
+        self.assertIn(b"A  muster/new_api.py", git(self.root, "status", "--porcelain"))
+        rollback_reviewed_patch(self.snapshot, generated.patch, generated.patch_hash, self.allowed, lock)
+        self.assertFalse((self.root / "muster" / "new_api.py").exists())
+        self.assertFalse(git(self.root, "status", "--porcelain").strip())
 
     def test_generation_rejects_symlinks_binary_secrets_generated_and_outside_paths(self):
         hostile = {
@@ -155,6 +198,28 @@ class DevelopmentSecurityTest(unittest.TestCase):
         link.symlink_to(self.root, target_is_directory=True)
         with self.assertRaises(DevelopmentSecurityError):
             source_snapshot("registered_app", link)
+
+    def test_coding_ladder_covers_framework_native_code_without_page_bias(self):
+        fixture_root = Path(__file__).parents[1] / "demo" / "fixtures"
+        scenario = json.loads((fixture_root / "frappeverse_coding_ladder_scenario.json").read_text())
+        prd_lines = (fixture_root / scenario["source_file"]).read_text().splitlines()
+        for requirement in scenario["requirements"]:
+            line = prd_lines[int(requirement["locator"].split(":")[1]) - 1].strip()
+            self.assertTrue(line.startswith("-"), requirement)
+        classifications = {row["classification"] for row in scenario["requirements"]}
+        self.assertTrue({
+            "metadata-js-jinja", "document-lifecycle-code", "orm-query-builder-api",
+            "existing-form-list-javascript", "migration-background-work",
+            "jinja-rendering", "apply-verify-rollback",
+        }.issubset(classifications))
+        encoded = json.dumps(scenario)
+        for expected in (
+            "doc_events", "frappe.get_list", "Query Builder", "frappe.ui.form.on",
+            "Email Template", "before_insert", "on_update", "enqueue-after-commit",
+            "MariaDB", "unsafe Jinja",
+        ):
+            self.assertIn(expected, encoded)
+        self.assertNotIn("page/service_operations", encoded)
 
 
 if __name__ == "__main__":

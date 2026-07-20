@@ -44,9 +44,14 @@ CAPABILITIES = {
     "frappe.metadata.property_setter.create": ("native_artifact", "property_setter"),
     "frappe.metadata.doctype.create": ("native_artifact", "doctype"),
     "frappe.metadata.page.create": ("native_artifact", "page"),
+    "frappe.metadata.workspace.create": ("native_artifact", "workspace"),
     "frappe.metadata.report.create": ("native_artifact", "report"),
+    "frappe.metadata.script_report.create": ("native_artifact", "script_report"),
     "frappe.metadata.print_format.create": ("native_artifact", "print_format"),
     "frappe.metadata.web_page.create": ("native_artifact", "web_page"),
+    "frappe.metadata.web_form.create": ("native_artifact", "web_form"),
+    "frappe.automation.notification.create": ("native_artifact", "notification"),
+    "frappe.automation.assignment_rule.create": ("native_artifact", "assignment_rule"),
 }
 
 
@@ -217,7 +222,11 @@ def _operation(value: Any) -> dict[str, Any]:
         return value
     if value.get("kind") == "native_artifact":
         _exact(value, {"kind", "artifactType", "intent"}, "native artifact operation")
-        if value.get("artifactType") not in {"custom_field", "property_setter", "doctype", "page", "report", "print_format", "web_page"} or not isinstance(value.get("intent"), dict):
+        if value.get("artifactType") not in {
+            "custom_field", "property_setter", "doctype", "page", "workspace", "report",
+            "script_report", "print_format", "web_page", "web_form", "notification",
+            "assignment_rule",
+        } or not isinstance(value.get("intent"), dict):
             raise MusterEffectCallbackError(_("The native artifact operation is unsupported"))
         return value
     raise MusterEffectCallbackError(_("The effect operation kind is unsupported"))

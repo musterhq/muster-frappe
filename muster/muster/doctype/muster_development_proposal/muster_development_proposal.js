@@ -16,6 +16,27 @@ frappe.ui.form.on("Muster Development Proposal", {
         () => call(frm, "muster.api.development.apply", {proposal: frm.doc.name, confirmed: 1}),
       ));
     }
+    if (frm.doc.status === "Applied" && frm.doc.deployment_status === "Ready for Separate Gate") {
+      if (!frm.doc.rollback_status || ["Not Requested", "Rejected"].includes(frm.doc.rollback_status)) {
+        frm.add_custom_button(__("Request exact rollback"), () => call(
+          frm, "muster.api.development.request_rollback", {proposal: frm.doc.name},
+        ), __("Destructive"));
+      }
+      if (frm.doc.rollback_status === "Pending Review") {
+        frm.add_custom_button(__("Approve rollback"), () => call(
+          frm, "muster.api.development.review_rollback", {proposal: frm.doc.name, action: "approve"},
+        ), __("Destructive"));
+        frm.add_custom_button(__("Reject rollback"), () => call(
+          frm, "muster.api.development.review_rollback", {proposal: frm.doc.name, action: "reject"},
+        ), __("Destructive"));
+      }
+      if (frm.doc.rollback_status === "Approved") {
+        frm.add_custom_button(__("Execute exact rollback"), () => frappe.confirm(
+          __("Reverse only the independently approved exact patch? Muster will refuse if any changed file has drifted."),
+          () => call(frm, "muster.api.development.rollback", {proposal: frm.doc.name, confirmed: 1}),
+        ), __("Destructive"));
+      }
+    }
   },
 });
 
@@ -32,4 +53,3 @@ async function call(frm, method, args) {
   await frappe.call({method, type: "POST", args, freeze: true});
   await frm.reload_doc();
 }
-

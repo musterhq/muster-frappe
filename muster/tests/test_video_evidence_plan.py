@@ -17,13 +17,13 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 class TestVideoEvidencePlan(unittest.TestCase):
     def test_catalog_has_realistic_personas_and_full_action_matrix(self):
         catalog = load_video_catalog()
-        self.assertEqual(len(catalog["personas"]), 10)
+        self.assertEqual(len(catalog["personas"]), 11)
         self.assertEqual(
             {case["app"] for case in catalog["cases"]},
             {"muster", "erpnext", "hrms", "crm"},
         )
         actions = {case["action"] for case in catalog["cases"]}
-        self.assertTrue({"create", "update", "submit", "approve", "list", "direct_url"} <= actions)
+        self.assertTrue({"create", "update", "delete", "submit", "approve", "list", "direct_url"} <= actions)
         self.assertTrue(actions <= ALLOWED_ACTIONS)
         self.assertEqual(
             {case["expected"] for case in catalog["cases"]},
@@ -41,7 +41,7 @@ class TestVideoEvidencePlan(unittest.TestCase):
         self.assertEqual(first, second)
         first_users = {persona["user"] for persona in first["personas"]}
         foreign_users = {persona["user"] for persona in foreign["personas"]}
-        self.assertEqual(len(first_users), 10)
+        self.assertEqual(len(first_users), 11)
         self.assertTrue(first_users.isdisjoint(foreign_users))
 
     def test_catalog_contains_no_password_material(self):
@@ -81,3 +81,16 @@ class TestVideoEvidencePlan(unittest.TestCase):
             self.assertGreater(len(persona["roles"]), 0)
         case_ids = [case["id"] for case in catalog["cases"]]
         self.assertEqual(len(case_ids), len(set(case_ids)))
+
+    def test_attended_update_delete_matrix_has_distinct_maker_checker_and_denied_user(self):
+        catalog = load_video_catalog()
+        personas = {persona["key"]: persona for persona in catalog["personas"]}
+        cases = {case["id"]: case for case in catalog["cases"]}
+        self.assertNotEqual("destructive_maker", "sales_approver")
+        self.assertIn("Muster Operator", personas["destructive_maker"]["roles"])
+        self.assertIn("Muster Approver", personas["sales_approver"]["roles"])
+        self.assertEqual(cases["destructive-maker-desk-update-allow"]["expected"], "allow")
+        self.assertEqual(cases["destructive-maker-desk-delete-allow"]["expected"], "allow")
+        self.assertEqual(cases["auditor-desk-delete-deny"]["expected"], "deny")
+        self.assertEqual(cases["crm-own-lead-update"]["expected"], "allow")
+        self.assertEqual(cases["crm-other-lead-update-deny"]["expected"], "deny")

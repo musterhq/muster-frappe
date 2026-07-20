@@ -19,8 +19,18 @@ class MusterWorkflowProposal(Document):
         if not self.is_new() and any(
             self.has_value_changed(field)
             for field in (
-                "requested_scope_json", "requested_scope_hash", "descriptor_json",
-                "compiled_graph_json", "capabilities_json",
+                "status", "reviewed_by", "reviewed_at", "destructive_record_revision",
+                "destructive_approval_proof", "published_workflow", "published_version",
+            )
+        ):
+            frappe.throw("Proposal decisions may change only through the governed review and publication APIs")
+        if not self.is_new() and any(
+            self.has_value_changed(field)
+            for field in (
+                "objective", "requested_by", "requested_at", "request_id", "gateway_request_id",
+                "requested_scope_json", "requested_scope_hash", "context_json", "run_metadata_json",
+                "descriptor_json", "descriptor_hash", "compiled_graph_json", "compiled_graph_hash",
+                "capabilities_json",
             )
         ):
             frappe.throw("The proposed workflow snapshots are immutable")

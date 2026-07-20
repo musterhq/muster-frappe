@@ -5,6 +5,7 @@
   const WAITING = new Set(["Waiting for Approval", "Paused", "Needs Intervention"]);
   const QUIET_EVENTS = new Set(["lease_claimed", "lease_heartbeat"]);
   const UI_SURFACES = new Set(["browser", "desk", "frappe_desk", "ui", "computer"]);
+  const ATTENDED_ACTION_PACE_MS = 850;
   const SAFE_PAYLOAD_KEYS = new Set([
     "actionLabel", "actionType", "approval", "changedFields", "currentRoute",
     "doctype", "documentName", "executionSurface", "fields", "fieldsAffected",
@@ -267,6 +268,556 @@
     }
   }
 
-  window.MusterLiveSessionModel = {parsePayload, normalizedEvent, derivePresence, viewModel};
+  function attendedReceipt(value) {
+    if (!value || typeof value !== "object" || value.save_requires_confirmation !== true || typeof value.save_authorized !== "boolean" || value.executed !== false) throw new Error(t("Muster could not verify this attended preview."));
+    const text = (input, maximum = 500) => {
+      if (typeof input !== "string" || !input.trim() || input.length > maximum || /[\u0000-\u001f\u007f]/.test(input)) throw new Error(t("Muster could not verify this attended preview."));
+      return input;
+    };
+    if (!["create", "update"].includes(value.operation) || !Array.isArray(value.fields) || !value.fields.length || value.fields.length > 100) throw new Error(t("Muster could not verify this attended preview."));
+    const fields = value.fields.map((field) => ({
+      fieldname: text(field?.fieldname, 140),
+      label: text(field?.label, 140),
+      control: ["fill", "select"].includes(field?.control) ? field.control : (() => { throw new Error(t("Muster could not verify this attended preview.")); })(),
+      value: text(String(field?.value ?? ""), 10_000),
+    }));
+    if (new Set(fields.map((field) => field.fieldname)).size !== fields.length) throw new Error(t("Muster could not verify this attended preview."));
+    const recordName = value.record_name == null ? null : value.record_name;
+    const recordRevision = value.record_revision == null ? null : value.record_revision;
+    if ((value.operation === "update" && recordName === null)
+      || (value.operation === "create" && (recordName !== null || recordRevision !== null))) throw new Error(t("Muster could not verify this attended preview."));
+    return Object.freeze({
+      proposal: text(value.proposal, 140), objective: text(value.objective, 10_000),
+      operation: value.operation, doctype: text(value.doctype, 140),
+      recordName: value.operation === "update" ? text(recordName) : null,
+      recordRevision: value.operation === "update" ? text(recordRevision, 100) : null,
+      saveAuthorized: value.save_authorized,
+      fields: Object.freeze(fields),
+    });
+  }
+
+  function attendedDeleteReceipt(value) {
+    const text = (input, maximum = 500) => {
+      if (typeof input !== "string" || !input.trim() || input.length > maximum || /[\u0000-\u001f]/.test(input)) throw new Error(t("Muster could not verify this delete review."));
+      return input;
+    };
+    if (!value || typeof value !== "object" || value.operation !== "delete" || value.delete_requires_confirmation !== true || typeof value.delete_authorized !== "boolean" || value.executed !== false || !Array.isArray(value.fields) || value.fields.length) throw new Error(t("Muster could not verify this delete review."));
+    const approvalProof = value.approval_proof == null ? null : value.approval_proof;
+    if ((value.delete_authorized && (typeof approvalProof !== "string" || !/^[a-f0-9]{64}$/.test(approvalProof)))
+      || (!value.delete_authorized && approvalProof !== null)) throw new Error(t("Muster could not verify this delete review."));
+    return Object.freeze({
+      proposal: text(value.proposal, 140), objective: text(value.objective, 10_000), operation: "delete",
+      doctype: text(value.doctype, 140), recordName: text(value.record_name), recordRevision: text(value.record_revision, 100),
+      approvalProof, deleteAuthorized: value.delete_authorized, saveAuthorized: false, fields: Object.freeze([]),
+    });
+  }
+
+  function attendedControlUnavailable(control) {
+    const enabled = (value) => value === true || value === 1 || value === "1";
+    return !control || enabled(control.df?.read_only) || enabled(control.df?.hidden);
+  }
+
+  function savePreflightMatches(value, preview) {
+    if (!value || !preview || value.current !== true || value.executed !== false
+      || value.proposal !== preview.proposal || value.operation !== preview.operation
+      || value.doctype !== preview.doctype || !Array.isArray(value.fields)
+      || value.fields.length !== preview.fields.length) return false;
+    if (preview.operation === "update" && (
+      value.record_name !== preview.recordName || value.record_revision !== preview.recordRevision
+    )) return false;
+    if (preview.operation === "create" && (value.record_name != null || value.record_revision != null)) return false;
+    return value.fields.every((field, index) => {
+      const expected = preview.fields[index];
+      return field && expected && field.fieldname === expected.fieldname
+        && field.label === expected.label && field.control === expected.control
+        && String(field.value ?? "") === expected.value;
+    });
+  }
+
+  function attendedElement(value) {
+    if (!value) return null;
+    if (value.nodeType === 1) return value;
+    if (value[0]?.nodeType === 1) return value[0];
+    return null;
+  }
+
+  function attendedElementVisible(value) {
+    const element = attendedElement(value);
+    if (!element || element.isConnected === false || element.hidden) return false;
+    const hiddenAncestor = element.closest?.("[hidden], [aria-hidden='true'], .hide, .hidden");
+    if (hiddenAncestor) return false;
+    const style = window.getComputedStyle?.(element);
+    if (style && (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")) return false;
+    const rectangle = element.getBoundingClientRect?.();
+    return Boolean(rectangle && rectangle.width > 0 && rectangle.height > 0);
+  }
+
+  class AttendedDeskPreview {
+    constructor() {
+      this.preview = null;
+      this.cancelled = false;
+      this.overlay = null;
+      this.lastCursor = null;
+      this.deleteReady = false;
+      this.deleteInFlight = false;
+    }
+
+    async start(receipt) {
+      if (this.preview) throw new Error(t("Another attended preview is already active."));
+      this.preview = attendedReceipt(receipt);
+      this.cancelled = false;
+      this.lastCursor = null;
+      this.deleteReady = false;
+      this.deleteInFlight = false;
+      this.renderStatus(t("Muster has taken over"), t("Opening the reviewed form…"), false);
+      try {
+        await this.openActualForm();
+        for (const field of this.preview.fields) {
+          this.assertActiveForm();
+          await this.pointToField(field);
+          await cur_frm.set_value(field.fieldname, field.value);
+          this.assertActiveForm();
+          if (!attendedElementVisible(cur_frm.fields_dict?.[field.fieldname]?.$wrapper)) throw new Error(`${field.label}: ${t("the real form control is no longer visible.")}`);
+          this.renderStatus(t("Muster has taken over"), `${t("Filled")} ${field.label}`, false);
+          await this.delay(ATTENDED_ACTION_PACE_MS);
+        }
+        this.renderStatus(
+          t("Review before Save"),
+          this.preview.saveAuthorized
+            ? t("Muster filled the permitted fields and paused. Nothing has been saved.")
+            : t("Muster filled the permitted fields. Return to the proposal for approval before Muster can Save."),
+          true,
+        );
+      } catch (error) {
+        this.finish();
+        throw error;
+      }
+    }
+
+    async startDelete(receipt) {
+      if (this.preview) throw new Error(t("Another attended preview is already active."));
+      this.preview = attendedDeleteReceipt(receipt);
+      this.cancelled = false;
+      this.lastCursor = null;
+      this.deleteReady = false;
+      this.renderStatus(t("Muster has taken over"), t("Opening the reviewed record…"), false);
+      try {
+        await this.openActualForm();
+        await this.pointToElement(this.activeForm().wrapper || this.activeForm().page?.wrapper || this.activeForm().$wrapper);
+        this.renderStatus(
+          t("Review before Delete"),
+          this.preview.deleteAuthorized
+            ? t("The exact record is open. Type its name to authorize one visible native Frappe deletion.")
+            : t("Return to the proposal for destructive-action approval. Muster has not opened or clicked Delete."),
+          true,
+        );
+      } catch (error) {
+        this.finish();
+        throw error;
+      }
+    }
+
+    async openActualForm() {
+      const {operation, doctype, recordName} = this.preview;
+      if (operation === "update" || operation === "delete") {
+        frappe.set_route("Form", doctype, recordName);
+        await this.waitFor(() => Boolean(this.visibleExactForm()));
+        this.assertRecordRevision(this.visibleExactForm());
+      } else {
+        frappe.set_route("List", doctype);
+        this.renderStatus(t("Muster has taken over"), `${t("Opening")} ${doctype} ${t("list…")}`, false);
+        await this.waitFor(() => Boolean(this.activeListPrimaryAction()));
+        const primary = this.activeListPrimaryAction();
+        if (!primary) throw new Error(t("The real Frappe list action is not visible."));
+        await this.pointToElement(primary);
+        this.renderStatus(t("Muster has taken over"), `${t("Selecting New")} ${doctype}…`, false);
+        primary.click();
+        await this.waitFor(() => Boolean(this.activeForm() || this.activeQuickEntryFullFormAction()));
+        if (!this.activeForm()) {
+          const fullForm = this.activeQuickEntryFullFormAction();
+          if (!fullForm) throw new Error(t("The real Frappe create form is not visible."));
+          await this.pointToElement(fullForm);
+          this.renderStatus(t("Muster has taken over"), `${t("Opening full")} ${doctype} ${t("form…")}`, false);
+          fullForm.click();
+        }
+      }
+      await this.waitFor(() => Boolean(this.activeForm()));
+      this.assertActiveForm();
+    }
+
+    activeQuickEntryFullFormAction() {
+      if (!this.preview || this.preview.operation !== "create") return null;
+      const route = frappe.get_route?.() || [];
+      if (route[0] !== "List" || route[1] !== this.preview.doctype) return null;
+      const dialogs = [...document.querySelectorAll(".modal.show, .modal.in")].filter(attendedElementVisible);
+      const expected = this.preview.doctype.toLowerCase();
+      const dialog = dialogs.find((candidate) => {
+        const title = candidate.querySelector?.(".modal-title")?.textContent?.trim().toLowerCase() || "";
+        return title.includes(expected);
+      });
+      if (!dialog) return null;
+      const expectedLabel = t("Edit Full Form").trim().toLowerCase();
+      const action = [...dialog.querySelectorAll("button")].find((button) =>
+        attendedElementVisible(button) && button.textContent?.trim().toLowerCase() === expectedLabel
+      );
+      return action && typeof action.click === "function" ? action : null;
+    }
+
+    activeListPrimaryAction() {
+      if (!this.preview || this.preview.operation !== "create") return null;
+      const route = frappe.get_route?.() || [];
+      const list = window.cur_list;
+      if (route[0] !== "List" || route[1] !== this.preview.doctype || list?.doctype !== this.preview.doctype || !attendedElementVisible(list.page?.wrapper)) return null;
+      const primary = attendedElement(list.page?.btn_primary);
+      return attendedElementVisible(primary) && typeof primary.click === "function" ? primary : null;
+    }
+
+    activeForm() {
+      const form = this.visibleExactForm();
+      if (!form) return null;
+      if (["update", "delete"].includes(this.preview.operation) && String(form.doc?.modified || "") !== this.preview.recordRevision) return null;
+      return form;
+    }
+
+    visibleExactForm() {
+      if (!this.preview) return null;
+      const route = frappe.get_route?.() || [];
+      const form = window.cur_frm;
+      if (route[0] !== "Form" || route[1] !== this.preview.doctype || !form || form.doctype !== this.preview.doctype || route[2] !== form.docname || !attendedElementVisible(form.wrapper || form.page?.wrapper || form.$wrapper)) return null;
+      if (["update", "delete"].includes(this.preview.operation) && form.docname !== this.preview.recordName) return null;
+      if (this.preview.operation === "create" && !(form.doc?.__islocal || form.doc?.__unsaved)) return null;
+      return form;
+    }
+
+    assertRecordRevision(form = this.visibleExactForm()) {
+      if (!["update", "delete"].includes(this.preview?.operation)) return;
+      if (!form || String(form.doc?.modified || "") !== this.preview.recordRevision) throw new Error(t("This record changed after review. Muster stopped; reload and prepare the action again."));
+    }
+
+    assertActiveForm() {
+      const form = this.activeForm();
+      if (this.cancelled || !form) throw new Error(t("The attended preview stopped because the real editable form is not visibly active."));
+      this.assertRecordRevision(form);
+      this.preview.fields.forEach((field) => {
+        const control = form.fields_dict?.[field.fieldname];
+        if (attendedControlUnavailable(control)) throw new Error(`${field.label}: ${t("this field is no longer available for attended work.")}`);
+        if (!attendedElementVisible(control.$wrapper)) throw new Error(`${field.label}: ${t("the real form control is not visible.")}`);
+      });
+    }
+
+    async pointToField(field) {
+      const wrapper = cur_frm.fields_dict[field.fieldname]?.$wrapper?.[0];
+      if (!attendedElementVisible(wrapper)) throw new Error(`${field.label}: ${t("the real form control is not visible.")}`);
+      await this.pointToElement(wrapper);
+    }
+
+    async pointToElement(value) {
+      const element = attendedElement(value);
+      if (!attendedElementVisible(element)) throw new Error(t("The real Frappe control is not visible."));
+      element.scrollIntoView?.({behavior: "smooth", block: "center"});
+      const rectangle = element.getBoundingClientRect();
+      this.lastCursor = {
+        x: `${Math.max(12, Math.min(window.innerWidth - 30, rectangle.left + rectangle.width * .72))}px`,
+        y: `${Math.max(70, Math.min(window.innerHeight - 40, rectangle.top + rectangle.height * .5))}px`,
+      };
+      this.applyCursor();
+      await this.delay(ATTENDED_ACTION_PACE_MS);
+    }
+
+    applyCursor() {
+      if (!this.lastCursor) return;
+      const cursor = this.overlay?.querySelector("[data-attended-cursor]");
+      cursor?.style?.setProperty("--attended-x", this.lastCursor.x);
+      cursor?.style?.setProperty("--attended-y", this.lastCursor.y);
+    }
+
+    renderStatus(title, detail, waiting) {
+      if (!this.overlay) {
+        this.overlay = document.createElement("section");
+        this.overlay.className = "muster-attended-overlay";
+        this.overlay.setAttribute("role", "status");
+        document.body.appendChild(this.overlay);
+      }
+      this.overlay.dataset.waiting = waiting ? "true" : "false";
+      const decision = waiting && this.preview?.operation === "delete" && this.deleteReady
+        ? `<button type="button" class="btn btn-sm btn-default" data-attended-stop>${html(t("Take control"))}</button>`
+        : waiting && this.preview?.operation === "delete" && this.preview.deleteAuthorized
+          ? `<button type="button" class="btn btn-sm btn-default" data-attended-stop>${html(t("Take control"))}</button><button type="button" class="btn btn-sm btn-danger" data-attended-delete>${html(t("Begin delete review"))}</button>`
+          : waiting && this.preview?.saveAuthorized
+        ? `<button type="button" class="btn btn-sm btn-default" data-attended-stop>${html(t("Take control"))}</button><button type="button" class="btn btn-sm btn-primary" data-attended-save>${html(t("Approve and Save"))}</button>`
+        : waiting ? `<button type="button" class="btn btn-sm btn-default" data-attended-stop>${html(t("Take control"))}</button><button type="button" class="btn btn-sm btn-primary" data-attended-review>${html(t("Return for approval"))}</button>` : "";
+      const cursorLabel = waiting ? t("Muster paused here") : t("Muster has taken over");
+      this.overlay.innerHTML = `<div class="muster-attended-banner"><img src="/assets/muster/images/muster-mark.png" alt=""><div><strong>${html(title)}</strong><small>${html(detail)}</small></div>${decision}</div><div class="muster-attended-cursor" data-attended-cursor aria-label="${html(cursorLabel)}"><i></i><span>${html(cursorLabel)}</span></div>`;
+      this.applyCursor();
+      this.overlay.querySelector("[data-attended-stop]")?.addEventListener("click", () => this.stop());
+      this.overlay.querySelector("[data-attended-save]")?.addEventListener("click", () => this.confirmSave());
+      this.overlay.querySelector("[data-attended-delete]")?.addEventListener("click", () => this.requestDeleteInitiation());
+      this.overlay.querySelector("[data-attended-review]")?.addEventListener("click", () => this.returnForApproval().catch((error) => this.showStopped(error)));
+    }
+
+    stop() {
+      this.cancelled = true;
+      this.finish();
+      frappe.show_alert({message: t("Muster stopped. The unsaved form remains under your control."), indicator: "orange"}, 7);
+    }
+
+    async returnForApproval() {
+      const proposal = this.preview?.proposal;
+      const active = window.cur_frm;
+      if (active && this.preview && active.doctype === this.preview.doctype) {
+        if (["update", "delete"].includes(this.preview.operation)) {
+          await active.reload_doc();
+        } else {
+          const name = active.docname;
+          if (frappe.model?.remove_from_locals) frappe.model.remove_from_locals(active.doctype, name);
+          if (active.doc) active.doc.__unsaved = 0;
+        }
+      }
+      this.finish();
+      if (proposal) frappe.set_route("Form", "Muster Workflow Proposal", proposal);
+    }
+
+    confirmSave() {
+      if (!this.preview) return;
+      frappe.confirm(
+        `${t("Allow Muster to save this")} ${html(this.preview.doctype)}?`,
+        () => this.save().catch((error) => {
+          if (this.preview) this.renderStatus(t("Review before Save"), t("Save stopped. Review the form and try again, or take control."), true);
+          this.showStopped(error);
+        }),
+      );
+    }
+
+    requestDeleteInitiation() {
+      if (this.preview?.operation !== "delete" || !this.preview.deleteAuthorized || this.deleteInFlight) return;
+      const dialog = new frappe.ui.Dialog({
+        title: t("Confirm destructive review"),
+        fields: [
+          {fieldname: "record_name", fieldtype: "Data", label: t("Type the exact record name"), reqd: 1},
+          {fieldname: "understand", fieldtype: "Check", label: t("I authorize Muster to use Frappe's visible Delete confirmation for this exact record"), reqd: 1, default: 0},
+        ],
+        primary_action_label: t("Delete this record visibly"),
+        primary_action: async (values) => {
+          if (values.record_name !== this.preview.recordName || !values.understand) {
+            frappe.msgprint(t("Type the exact record name and acknowledge the destructive boundary."));
+            return;
+          }
+          dialog.disable_primary_action();
+          try {
+            await this.executeDelete(values.record_name);
+            dialog.hide();
+          } catch (error) {
+            if (this.preview) this.renderStatus(
+              t("Deletion stopped safely"),
+              t("Do not repeat the deletion. Check the visible Frappe form and the proposal audit record."),
+              true,
+            );
+            this.showStopped(error);
+          } finally {
+            dialog.enable_primary_action();
+          }
+        },
+      });
+      dialog.show();
+    }
+
+    async executeDelete(typedRecordName) {
+      if (this.preview?.operation !== "delete" || !this.preview.deleteAuthorized) throw new Error(t("Destructive review authority is unavailable."));
+      if (this.deleteInFlight) throw new Error(t("This deletion is already in progress."));
+      this.deleteInFlight = true;
+      let authorizationToken = null;
+      let verificationToken = null;
+      try {
+      this.assertActiveForm();
+      const issued = await frappe.call({
+        method: "muster.api.mission.issue_attended_delete", type: "POST",
+        args: {
+          proposal: this.preview.proposal, typed_record_name: typedRecordName,
+          confirmed: 1, idempotency_key: frappe.utils.get_random(24),
+        },
+      });
+      const grant = issued.message;
+      if (grant?.issued !== true || grant?.executed !== false || grant?.proposal !== this.preview.proposal
+        || grant?.doctype !== this.preview.doctype || grant?.record_name !== this.preview.recordName
+        || typeof grant?.authorization !== "string" || typeof grant?.authorization_token !== "string") {
+        throw new Error(t("The one-time delete authorization could not be verified."));
+      }
+      authorizationToken = grant.authorization_token;
+      this.assertRecordRevision();
+      const menu = this.activeFormMenuButton();
+      if (!menu) throw new Error(t("The real Frappe form menu is not visible."));
+      await this.pointToElement(menu);
+      menu.click();
+      await this.waitFor(() => Boolean(this.activeDeleteAction()));
+      const deleteAction = this.activeDeleteAction();
+      if (!deleteAction) throw new Error(t("The real Frappe Delete action is not visible."));
+      await this.pointToElement(deleteAction);
+      this.deleteReady = true;
+      this.renderStatus(
+        t("Muster has taken over"),
+        t("Opening Frappe's own Delete confirmation…"),
+        false,
+      );
+      const existingDialogs = new Set(this.visibleNativeDialogs());
+      deleteAction.click();
+      await this.waitFor(() => Boolean(this.nativeDeleteConfirmation(existingDialogs)));
+      const confirmation = this.nativeDeleteConfirmation(existingDialogs);
+      if (!confirmation) throw new Error(t("Frappe's native Delete confirmation did not appear."));
+      const confirmButton = this.nativeDeleteConfirmationButton(confirmation);
+      if (!confirmButton) throw new Error(t("Frappe's native Delete confirmation action is unavailable."));
+      await this.pointToElement(confirmButton);
+      this.renderStatus(t("Muster has taken over"), t("Confirming this exact deletion in Frappe…"), false);
+      const consumed = await frappe.call({
+        method: "muster.api.mission.consume_attended_delete", type: "POST",
+        args: {
+          authorization: grant.authorization, authorization_token: authorizationToken,
+          confirmed: 1, idempotency_key: frappe.utils.get_random(24),
+        },
+      });
+      authorizationToken = null;
+      const consumption = consumed.message;
+      if (consumption?.consumed !== true || consumption?.executed !== false
+        || consumption?.authorization !== grant.authorization || consumption?.record_name !== this.preview.recordName
+        || typeof consumption?.verification_token !== "string") {
+        throw new Error(t("The one-time delete authorization could not be consumed."));
+      }
+      verificationToken = consumption.verification_token;
+      confirmButton.click();
+      await this.waitFor(() => !this.visibleExactForm() && !attendedElementVisible(confirmation));
+      const verified = await frappe.call({
+        method: "muster.api.mission.verify_attended_delete_result", type: "POST",
+        args: {
+          authorization: grant.authorization, verification_token: verificationToken,
+          confirmed: 1, idempotency_key: frappe.utils.get_random(24),
+        },
+      });
+      verificationToken = null;
+      if (verified.message?.verified !== true || verified.message?.executed !== true
+        || verified.message?.record_name !== this.preview.recordName || typeof verified.message?.receipt_hash !== "string") {
+        throw new Error(t("Frappe could not verify that the record was deleted."));
+      }
+      const deletedName = this.preview.recordName;
+      this.finish();
+      frappe.show_alert({message: `${t("Deleted and verified")}: ${html(deletedName)}`, indicator: "green"}, 10);
+      } finally {
+        authorizationToken = null;
+        verificationToken = null;
+        this.deleteInFlight = false;
+      }
+    }
+
+    visibleNativeDialogs() {
+      return [...document.querySelectorAll?.(".modal.show, .modal.in") || []].filter(attendedElementVisible);
+    }
+
+    nativeDeleteConfirmation(existingDialogs = new Set()) {
+      if (!this.preview) return null;
+      const expectedName = this.preview.recordName.toLowerCase();
+      return this.visibleNativeDialogs().find((dialog) => {
+        if (existingDialogs.has(dialog)) return false;
+        const textContent = String(dialog.textContent || "").trim().toLowerCase();
+        const title = String(dialog.querySelector?.(".modal-title")?.textContent || "").trim().toLowerCase();
+        return (textContent.includes("delete") || title.includes("delete") || textContent.includes(expectedName))
+          && Boolean(this.nativeDeleteConfirmationButton(dialog));
+      }) || null;
+    }
+
+    nativeDeleteConfirmationButton(dialog) {
+      const accepted = new Set([t("Yes").trim().toLowerCase(), t("Delete").trim().toLowerCase()]);
+      return [...dialog?.querySelectorAll?.("button") || []].find((candidate) =>
+        attendedElementVisible(candidate) && accepted.has(String(candidate.textContent || "").trim().toLowerCase())
+        && typeof candidate.click === "function"
+      ) || null;
+    }
+
+    activeFormMenuButton() {
+      const form = this.activeForm();
+      const menu = attendedElement(form?.page?.btn_menu);
+      return attendedElementVisible(menu) && typeof menu.click === "function" ? menu : null;
+    }
+
+    activeDeleteAction() {
+      const form = this.activeForm();
+      const menu = attendedElement(form?.page?.menu);
+      if (!attendedElementVisible(menu)) return null;
+      const label = t("Delete").trim().toLowerCase();
+      const action = [...menu.querySelectorAll("a, button")].find((candidate) =>
+        attendedElementVisible(candidate) && candidate.textContent?.trim().toLowerCase() === label
+      );
+      return action && typeof action.click === "function" ? action : null;
+    }
+
+    async save() {
+      this.assertActiveForm();
+      if (!this.preview.saveAuthorized) throw new Error(t("Approve this proposal before Muster can Save."));
+      this.preview.fields.forEach((field) => {
+        if (String(cur_frm.doc[field.fieldname] ?? "") !== field.value) throw new Error(`${field.label}: ${t("the value changed after review.")}`);
+      });
+      const preflight = await frappe.call({
+        method: "muster.api.mission.preflight_attended_save", type: "POST",
+        args: {
+          proposal: this.preview.proposal,
+          record_name: this.preview.operation === "update" ? this.preview.recordName : "",
+          record_revision: this.preview.operation === "update" ? this.preview.recordRevision : "",
+          confirmed: 1,
+          idempotency_key: frappe.utils.get_random(24),
+        },
+      });
+      if (!savePreflightMatches(preflight.message, this.preview)) throw new Error(t("The reviewed record, fields, or permissions changed. Muster stopped before Save."));
+      if (this.preview.operation === "update") this.assertRecordRevision();
+      const button = this.overlay?.querySelector("[data-attended-save]");
+      if (button) button.disabled = true;
+      this.renderStatus(t("Muster has taken over"), t("Saving the approved form…"), false);
+      await cur_frm.save();
+      const recordName = cur_frm.docname;
+      let response;
+      try {
+        response = await frappe.call({
+          method: "muster.api.mission.verify_attended_save", type: "POST",
+          args: {proposal: this.preview.proposal, record_name: recordName, confirmed: 1, idempotency_key: frappe.utils.get_random(24)},
+        });
+        if (response.message?.verified !== true || response.message?.record_name !== recordName) throw new Error(t("Frappe could not verify the saved record."));
+      } catch (_error) {
+        this.finish();
+        frappe.msgprint({
+          title: t("Record saved; verification needs attention"), indicator: "orange",
+          message: t("Frappe saved the record, but Muster could not complete its reread proof. Do not repeat the Save; review the record and audit evidence."),
+        });
+        return;
+      }
+      this.finish();
+      frappe.show_alert({message: `${t("Saved and verified")}: ${html(recordName)}`, indicator: "green"}, 10);
+    }
+
+    showStopped(error) {
+      frappe.msgprint({
+        title: t("Attended work stopped"),
+        message: t("Muster stopped safely. Review the visible form and the proposal audit record before trying again."),
+        indicator: "red",
+      });
+    }
+
+    finish() {
+      this.overlay?.remove?.();
+      this.overlay = null;
+      this.preview = null;
+      this.lastCursor = null;
+      this.deleteReady = false;
+      this.deleteInFlight = false;
+    }
+
+    delay(milliseconds) { return new Promise((resolve) => window.setTimeout(resolve, milliseconds)); }
+
+    async waitFor(predicate, timeout = 15_000) {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started >= timeout) throw new Error(t("The reviewed Frappe form did not open in time."));
+        await this.delay(100);
+      }
+    }
+  }
+
+  window.MusterLiveSessionModel = {parsePayload, normalizedEvent, derivePresence, viewModel, attendedReceipt, attendedDeleteReceipt, attendedControlUnavailable, attendedElementVisible, savePreflightMatches, AttendedDeskPreview, ATTENDED_ACTION_PACE_MS};
   window.musterLiveSession = window.musterLiveSession || new LiveWorkSession();
+  window.musterAttendedPreview = window.musterAttendedPreview || new AttendedDeskPreview();
 })();

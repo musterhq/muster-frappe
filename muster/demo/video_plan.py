@@ -7,12 +7,13 @@ from typing import Any
 from muster.demo.plan import short_id
 
 ALLOWED_EXPECTATIONS = frozenset({"allow", "deny", "hidden"})
-ALLOWED_ACTIONS = frozenset({"read", "list", "direct_url", "create", "update", "submit", "approve"})
+ALLOWED_ACTIONS = frozenset({"read", "list", "direct_url", "create", "update", "delete", "submit", "approve"})
 KNOWN_RECORD_ALIASES = frozenset(
     {
         "company",
         "customer_east",
         "customer_west",
+        "customer_delete_target",
         "supplier_east",
         "supplier_west",
         "department_east",
@@ -87,9 +88,23 @@ def validate_video_catalog(catalog: dict[str, Any]) -> None:
     if {case["app"] for case in cases} != required_apps:
         raise ValueError("every required app must be represented in the evidence cases")
     actions = {case["action"] for case in cases}
-    required_actions = {"create", "update", "submit", "approve", "list", "direct_url"}
+    required_actions = {"create", "update", "delete", "submit", "approve", "list", "direct_url"}
     if not required_actions.issubset(actions):
         raise ValueError("video cases do not cover the full separation-of-duties matrix")
+    by_id = {case["id"]: case for case in cases}
+    required_attended = {
+        "destructive-maker-desk-update-allow": ("destructive_maker", "update", "allow"),
+        "destructive-maker-desk-delete-allow": ("destructive_maker", "delete", "allow"),
+        "muster-approver-approve-allow": ("sales_approver", "approve", "allow"),
+        "auditor-desk-delete-deny": ("auditor", "delete", "deny"),
+        "crm-own-lead-update": ("crm_operator", "update", "allow"),
+        "crm-other-lead-update-deny": ("crm_operator", "update", "deny"),
+    }
+    for case_id, expected in required_attended.items():
+        case = by_id.get(case_id) or {}
+        actual = (case.get("persona"), case.get("action"), case.get("expected"))
+        if actual != expected:
+            raise ValueError(f"attended RBAC evidence case {case_id} is missing or malformed")
 
 
 def build_video_plan(site: str) -> dict[str, Any]:

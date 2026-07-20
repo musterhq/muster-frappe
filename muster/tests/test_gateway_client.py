@@ -112,6 +112,17 @@ class TestGatewayClient(unittest.TestCase):
         with self.assertRaises(GatewayClientError):
             client.request("GET", "/v1/test", headers={"authorization": "Bearer attacker"})
 
+    def test_request_accepts_only_a_bounded_internal_read_timeout(self):
+        response = _Response(chunks=(b'{"ok":true}',))
+        session = Mock()
+        session.request.return_value = response
+        client = GatewayClient(self.binding, session=session)
+        self.assertEqual(client.request("GET", "/v1/test", read_timeout=180), {"ok": True})
+        self.assertEqual(session.request.call_args.kwargs["timeout"], (3.05, 180))
+        for invalid in (0, 301, True, "30"):
+            with self.subTest(invalid=invalid), self.assertRaises(GatewayClientError):
+                client.request("GET", "/v1/test", read_timeout=invalid)
+
     def test_response_body_is_bounded_while_streaming(self):
         response = _Response(chunks=(b"a" * MAX_RESPONSE_BYTES, b"b"))
         session = Mock()

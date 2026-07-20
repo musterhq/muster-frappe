@@ -69,6 +69,7 @@ class ScaleProfile:
 
 @dataclass(frozen=True)
 class BusinessScaleProfile:
+    companies: int
     customers: int
     suppliers: int
     employees: int
@@ -85,6 +86,7 @@ class BusinessScaleProfile:
 
     def expected_counts(self) -> dict[str, int]:
         return {
+            "companies": self.companies,
             "customers": self.customers,
             "suppliers": self.suppliers,
             "employees": self.employees,

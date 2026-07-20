@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from hashlib import sha256
 from typing import Any
 from urllib.parse import quote
@@ -9,6 +10,7 @@ from urllib.parse import quote
 import frappe
 from frappe import _
 from frappe.utils import add_to_date, cint, get_datetime, now_datetime
+from frappe.utils.password import set_encrypted_password
 
 from muster.adapters.client import GatewayClient, trusted_binding
 from muster.adapters.context import permission_filtered_context
@@ -28,6 +30,12 @@ ASK_INTENTS_PATH = "/v1/integrations/frappe/ask-intents"
 RUN_ID = re.compile(r"^msg_[A-Za-z0-9-]+$")
 CONVERSATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,199}$")
 MAX_PROMPT_CHARS = 100_000
+MAX_CLARIFICATION_REPLY_CHARS = 4_000
+MAX_MERGED_OBJECTIVE_CHARS = 100_000
+MAX_EXACT_RECORD_CANDIDATES = 1
+CLARIFICATION_TTL_MINUTES = 15
+CLARIFICATION_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
 _LIVE_READ_REQUEST = re.compile(
     r"\b(?:how many|count|total|sum|average|list|show me|find|which|overdue|pending|outstanding|latest|recent|current status)\b",
     re.IGNORECASE,
@@ -41,11 +49,101 @@ _ASK_OUTCOMES = {
     "durable_workflow", "attended_browser", "development_workflow",
 }
 _HANDOFF_LABELS = {
-    "governed_change": _("Prepare this governed change"),
+    "governed_change": _("Open the form and review changes"),
     "durable_workflow": _("Create a reusable workflow proposal"),
-    "attended_browser": _("Prepare an attended browser workflow"),
+    "attended_browser": _("Open the form and review changes"),
     "development_workflow": _("Prepare a reviewed development workflow"),
 }
+_EFFECTFUL_OUTCOMES = {
+    "governed_change", "durable_workflow", "attended_browser", "development_workflow",
+}
+_TOOL_CALL_KINDS = {"tool", "mcp"}
+_TOOL_CALL_STATUSES = {"queued", "running", "completed", "failed", "denied"}
+_INTERNAL_PRESENTATION = re.compile(
+    r"(?:\b(?:provider|model|backend|stack|trace|sha-?256|checksum|token|secret|runtime id|request id)\b"
+    r"|(?:/home|/srv|/tmp|localhost|127\.0\.0\.1)"
+    r"|\b[a-f0-9]{40,}\b)",
+    re.IGNORECASE,
+)
+_DIAGNOSTIC_LINE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:provider|model|backend|runtime|request|trace|traceback|stack|"
+    r"tool[_ -]?call|raw[_ -]?(?:request|response|arguments?))\s*(?::|=|\{)",
+    re.IGNORECASE,
+)
+_INTERNAL_FENCE = re.compile(
+    r"```[^\n]*\n(?:(?!```).)*(?:provider|backend|traceback|stack trace|request[_ -]?id|"
+    r"runtime[_ -]?id|tool[_ -]?calls?|/srv/|/tmp/|localhost|127\.0\.0\.1)(?:(?!```).)*```",
+    re.IGNORECASE | re.DOTALL,
+)
+_INTERNAL_ARTIFACT = re.compile(
+    r"(?:/home/|/srv/|/tmp/|localhost|127\.0\.0\.1|\b[a-f0-9]{40,}\b|"
+    r"\b(?:token|secret|request[_ -]?id|runtime[_ -]?id)\s*[:=])",
+    re.IGNORECASE,
+)
+
+
+def _effectful_fast_reply(outcomes: list[str]) -> dict[str, str] | None:
+    """Keep proposed work out of the provider narration lane."""
+    if not _EFFECTFUL_OUTCOMES.intersection(outcomes):
+        return None
+    return {
+        "text": _(
+            "I can prepare this for review. Nothing has run or changed yet. "
+            "Choose a next step below to review the proposed work before anything runs."
+        )
+    }
+
+
+def _presentable_tool_calls(value: Any) -> list[dict[str, Any]]:
+    """Keep host-issued tool evidence useful without exposing runtime internals."""
+    if not isinstance(value, list):
+        return []
+    result = []
+    for row in value[:24]:
+        if not isinstance(row, dict) or row.get("kind") not in _TOOL_CALL_KINDS or row.get("status") not in _TOOL_CALL_STATUSES:
+            continue
+        status = row["status"]
+        label = str(row.get("label") or "").strip()[:160]
+        summary = str(row.get("summary") or "").strip()[:500]
+        if not label or not summary:
+            continue
+        if _INTERNAL_PRESENTATION.search(label):
+            label = _("Muster step")
+        if status == "failed":
+            summary = _("This step could not be completed. Nothing was changed.")
+        elif status == "denied":
+            summary = _("This step is not permitted for your current access. Nothing was changed.")
+        elif _INTERNAL_PRESENTATION.search(summary):
+            summary = {
+                "queued": _("This permitted step is waiting to start."),
+                "running": _("This permitted step is in progress."),
+                "completed": _("This permitted step completed."),
+            }.get(status, _("This step was checked."))
+        details = row.get("details") if isinstance(row.get("details"), dict) else {}
+        public_details = {
+            key: str(details[key]).strip()[:500]
+            for key in ("purpose", "scope", "outcome")
+            if isinstance(details.get(key), str) and details[key].strip()
+            and not _INTERNAL_PRESENTATION.search(details[key])
+        }
+        result.append({
+            "kind": row["kind"], "status": status,
+            "label": label, "summary": summary,
+            **({"details": public_details} if public_details else {}),
+        })
+    return result
+
+
+def _presentable_answer(value: str) -> str:
+    """Remove runtime diagnostics while preserving ordinary business prose."""
+    text = _INTERNAL_FENCE.sub("", value[:64_000])
+    public_lines = []
+    for line in text.splitlines():
+        if _DIAGNOSTIC_LINE.search(line) or _INTERNAL_ARTIFACT.search(line):
+            continue
+        public_lines.append(line.rstrip())
+    public = re.sub(r"\n{3,}", "\n\n", "\n".join(public_lines)).strip()
+    return public or _("Muster completed the request. No additional details are available.")
 
 
 def _require_user() -> str:
@@ -131,11 +229,23 @@ def _validated_intent(response: dict[str, Any], request_id: str) -> dict[str, An
 
 def _handoffs(outcomes: list[str], request_id: str) -> list[dict[str, str]]:
     handoffs = []
+    emitted = set()
     for outcome in outcomes:
         label = _HANDOFF_LABELS.get(outcome)
         if not label:
             continue
-        kind = "workflow_proposal" if outcome in {"artifact", "durable_workflow"} else outcome
+        # A one-off record mutation is always shown in its real Frappe form.
+        # "governed_change" remains a useful classifier outcome, but it is not
+        # a separate user journey: create/update/delete all use the attended
+        # browser review boundary.
+        kind = (
+            "attended_browser" if outcome == "governed_change"
+            else "workflow_proposal" if outcome in {"artifact", "durable_workflow"}
+            else outcome
+        )
+        if kind in emitted:
+            continue
+        emitted.add(kind)
         handoffs.append({
             "id": f"handoff-{sha256(f'{request_id}:{kind}'.encode()).hexdigest()[:20]}",
             "kind": kind,
@@ -146,7 +256,48 @@ def _handoffs(outcomes: list[str], request_id: str) -> list[dict[str, str]]:
     return handoffs
 
 
-def _ask_turn(user: str, conversation: str, key: str, prompt: str, scope: dict[str, Any], outcomes: list[str], handoffs: list[dict[str, str]], clarification: str | None = None):
+def _exact_record_continuation_intent(parent, request_id: str) -> dict[str, Any] | None:
+    """Reuse an already-governed route after Frappe verifies one exact record.
+
+    The classifier cannot grant authority, and asking it to classify the merged
+    prose again can reopen the exact-record question indefinitely.  The parent
+    route is safe to inherit only when its persisted outcomes and handoffs still
+    exactly match the deterministic evidence created for that parent turn.
+    """
+    if not parent or parent.clarification_kind != "exact_record":
+        return None
+    try:
+        outcomes = json.loads(parent.outcomes_json or "[]")
+        stored_handoffs = json.loads(parent.handoffs_json or "[]")
+    except (TypeError, ValueError):
+        frappe.throw(_("The parent Ask routing evidence is invalid"), frappe.ValidationError)
+    if (
+        not isinstance(outcomes, list) or not outcomes or len(outcomes) > len(_ASK_OUTCOMES)
+        or any(item not in _ASK_OUTCOMES for item in outcomes)
+        or len(set(outcomes)) != len(outcomes)
+    ):
+        frappe.throw(_("The parent Ask routing evidence is invalid"), frappe.ValidationError)
+    parent_request_id = f"intent-{sha256(f'{parent.requested_by}:{parent.conversation_id}:{parent.request_id}'.encode()).hexdigest()[:32]}"
+    expected_parent_handoffs = _handoffs(outcomes, parent_request_id)
+    selected = next(
+        (item for item in expected_parent_handoffs if item.get("id") == parent.clarification_handoff_id),
+        None,
+    )
+    clarification_source_is_valid = parent.clarification_handoff_id == "intent" or bool(selected)
+    if stored_handoffs != expected_parent_handoffs or not expected_parent_handoffs or not clarification_source_is_valid:
+        frappe.throw(_("The parent Ask routing evidence is invalid"), frappe.ValidationError)
+    return {
+        "outcomes": outcomes,
+        "clarification": None,
+        "handoffs": _handoffs(outcomes, request_id),
+    }
+
+
+def _ask_turn(
+    user: str, conversation: str, key: str, prompt: str, scope: dict[str, Any],
+    outcomes: list[str], handoffs: list[dict[str, str]], clarification: str | None = None,
+    lineage: dict[str, str] | None = None,
+):
     prompt_hash = _hash_text(prompt)
     scope_json = _canonical(scope)
     scope_hash = _hash_text(scope_json)
@@ -159,6 +310,14 @@ def _ask_turn(user: str, conversation: str, key: str, prompt: str, scope: dict[s
             or json.loads(existing.outcomes_json or "[]") != outcomes
             or json.loads(existing.handoffs_json or "[]") != handoffs
             or (existing.clarification or None) != clarification
+            or (existing.parent_ask_turn or None) != ((lineage or {}).get("parent_turn_id") or None)
+            or (existing.parent_handoff_id or None) != ((lineage or {}).get("handoff_id") or None)
+            or (existing.clarification_reply_hash or None) != ((lineage or {}).get("reply_hash") or None)
+            or (existing.verified_target_doctype or None) != ((lineage or {}).get("verified_target_doctype") or None)
+            or (existing.verified_target_name or None) != ((lineage or {}).get("verified_target_name") or None)
+            or (existing.verified_target_action or None) != ((lineage or {}).get("verified_target_action") or None)
+            or (str(existing.verified_target_at) if existing.verified_target_at else None) != ((lineage or {}).get("verified_target_at") or None)
+            or (existing.verified_target_evidence_hash or None) != ((lineage or {}).get("verified_target_evidence_hash") or None)
         ):
             frappe.throw(_("This Ask idempotency key was already used for another request"), frappe.ValidationError)
         return existing
@@ -176,9 +335,267 @@ def _ask_turn(user: str, conversation: str, key: str, prompt: str, scope: dict[s
         "outcomes_json": _canonical(outcomes),
         "handoffs_json": _canonical(handoffs),
         "clarification": clarification,
+        "parent_ask_turn": (lineage or {}).get("parent_turn_id"),
+        "parent_handoff_id": (lineage or {}).get("handoff_id"),
+        "clarification_reply_hash": (lineage or {}).get("reply_hash"),
+        "verified_target_doctype": (lineage or {}).get("verified_target_doctype"),
+        "verified_target_name": (lineage or {}).get("verified_target_name"),
+        "verified_target_action": (lineage or {}).get("verified_target_action"),
+        "verified_target_evidence_hash": (lineage or {}).get("verified_target_evidence_hash"),
+        "verified_target_at": (lineage or {}).get("verified_target_at"),
     })
     doc.insert()
     return doc
+
+
+def _safe_clarification_reason(value: Any) -> str:
+    reason = value.strip() if isinstance(value, str) else ""
+    if not reason or len(reason) > 500 or _INTERNAL_PRESENTATION.search(reason):
+        frappe.throw(_("Muster could not safely present the requested clarification"), frappe.ValidationError)
+    return reason
+
+
+def _record_clarification_target(turn, reason: str) -> dict[str, str] | None:
+    try:
+        scope = json.loads(turn.scope_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    doctype = scope.get("doctype") if isinstance(scope, dict) else None
+    prompt = turn.get_password("prompt_secret")
+    actions = [
+        action for action, pattern in (
+            ("update", r"\b(?:change|edit|modify|rename|set|update)\b"),
+            ("delete", r"\b(?:delete|remove|erase)\b"),
+        ) if re.search(pattern, prompt, re.IGNORECASE)
+    ]
+    if not isinstance(doctype, str) or not doctype.strip() or len(actions) != 1:
+        return None
+    doctype = doctype.strip()
+    expected = _("Which exact {0} record should I {1}?").format(doctype, actions[0])
+    return {"doctype": doctype, "action": actions[0]} if reason == expected else None
+
+
+def _issue_clarification(turn, handoff_id: str, reason: Any) -> dict[str, Any]:
+    """Issue a one-purpose bearer that can add facts, never authority, to this turn."""
+    safe_reason = _safe_clarification_reason(reason)
+    target = _record_clarification_target(turn, safe_reason)
+    if turn.clarification_consumed_at:
+        frappe.throw(_("This clarification was already answered"), frappe.ValidationError)
+    active = bool(turn.clarification_token_hash and turn.clarification_expires_at)
+    if active:
+        if turn.clarification_handoff_id != handoff_id or turn.clarification_reason != safe_reason:
+            frappe.throw(_("The pending clarification no longer matches this request"), frappe.ValidationError)
+        if bool(target) != bool(turn.clarification_kind == "exact_record"):
+            frappe.throw(_("The pending clarification target no longer matches this request"), frappe.ValidationError)
+        token = turn.get_password("clarification_token_secret")
+    else:
+        token = secrets.token_urlsafe(32)
+        set_encrypted_password("Muster Ask Turn", turn.name, token, "clarification_token_secret")
+        turn.db_set({
+            "clarification_handoff_id": handoff_id,
+            "clarification_reason": safe_reason,
+            "clarification_kind": "exact_record" if target else "missing_detail",
+            "clarification_target_doctype": (target or {}).get("doctype"),
+            "clarification_target_action": (target or {}).get("action"),
+            "clarification_token_hash": _hash_text(token),
+            "clarification_issued_at": now_datetime(),
+            "clarification_expires_at": add_to_date(now_datetime(), minutes=CLARIFICATION_TTL_MINUTES),
+        }, update_modified=False)
+    return {
+        "turn_id": turn.name,
+        "handoff_id": handoff_id,
+        "token": token,
+        "conversation_id": turn.conversation_id,
+        "prompt_hash": turn.prompt_hash,
+        "expires_at": str(turn.clarification_expires_at),
+        "bound_scope": json.loads(turn.scope_json or "{}"),
+    }
+
+
+def _verified_exact_record(
+    parent, reply: str, user: str, conversation: str,
+) -> dict[str, str] | None:
+    if parent.clarification_kind != "exact_record":
+        return None
+    candidates = [line.strip() for line in reply.replace("\r", "\n").split("\n") if line.strip()]
+    if len(candidates) != MAX_EXACT_RECORD_CANDIDATES or len(candidates[0]) > 500:
+        frappe.throw(_("Provide one exact record ID only"), frappe.ValidationError)
+    candidate = candidates[0]
+    if parent.clarification_consumed_at and parent.clarification_child_turn:
+        child = frappe.get_doc("Muster Ask Turn", parent.clarification_child_turn)
+        if child.verified_target_name != candidate:
+            frappe.throw(_("This clarification reply was already used"), frappe.ValidationError)
+        _verified_turn_record_identity(child, user)
+        return {
+            "verified_target_doctype": child.verified_target_doctype,
+            "verified_target_name": child.verified_target_name,
+            "verified_target_action": child.verified_target_action,
+            "verified_target_at": str(child.verified_target_at),
+            "verified_target_evidence_hash": child.verified_target_evidence_hash,
+        }
+    scope = json.loads(parent.scope_json or "{}")
+    selected = scope.get("doctype") if isinstance(scope, dict) else None
+    referenced_doctypes = {
+        row.get("doctype") for row in (scope.get("documents") or [])
+        if isinstance(row, dict) and isinstance(row.get("doctype"), str)
+    }
+    scoped_names = {
+        str(row.get("name") or row.get("docname")) for row in (scope.get("documents") or [])
+        if isinstance(row, dict) and row.get("doctype") == selected and (row.get("name") or row.get("docname"))
+    }
+    if scope.get("docname"):
+        scoped_names.add(str(scope["docname"]))
+    if (
+        not isinstance(selected, str) or not selected
+        or selected != parent.clarification_target_doctype
+        or any(doctype != selected for doctype in referenced_doctypes)
+        or parent.clarification_target_action not in {"update", "delete"}
+        or (scoped_names and candidate not in scoped_names)
+    ):
+        frappe.throw(_("This clarification does not identify one permitted record type"), frappe.ValidationError)
+    permission = "write" if parent.clarification_target_action == "update" else "delete"
+    if (
+        not frappe.db.exists("DocType", selected)
+        or not frappe.db.exists(selected, candidate)
+        or not frappe.has_permission(selected, "read", doc=candidate, user=user)
+        or not frappe.has_permission(selected, permission, doc=candidate, user=user)
+    ):
+        frappe.throw(_("I could not verify one permitted record with that exact ID"), frappe.PermissionError)
+    verified_at = str(now_datetime())
+    evidence = {
+        "schema_version": 1, "parent_turn_id": parent.name,
+        "parent_prompt_hash": parent.prompt_hash, "reply_hash": _hash_text(candidate),
+        "user": user, "conversation_id": conversation,
+        "action": parent.clarification_target_action, "doctype": selected,
+        "record_name": candidate, "verified_at": verified_at,
+    }
+    return {
+        "verified_target_doctype": selected,
+        "verified_target_name": candidate,
+        "verified_target_action": parent.clarification_target_action,
+        "verified_target_at": verified_at,
+        "verified_target_evidence_hash": _hash_text(_canonical(evidence)),
+    }
+
+
+def _clarification_lineage(
+    *, user: str, conversation: str, key: str, reply: str, submitted_scope: dict[str, Any],
+    turn_id: str | None, handoff_id: str | None, token: str | None, prompt_hash: str | None,
+) -> tuple[str, dict[str, Any], dict[str, str], Any] | None:
+    supplied = [turn_id, handoff_id, token, prompt_hash]
+    if not any(value is not None for value in supplied):
+        return None
+    if not all(isinstance(value, str) for value in supplied):
+        frappe.throw(_("The clarification reference is incomplete"), frappe.ValidationError)
+    if (
+        not turn_id or len(turn_id) > 140 or len(handoff_id) > 140
+        or not CLARIFICATION_TOKEN.fullmatch(token) or not SHA256_HEX.fullmatch(prompt_hash)
+    ):
+        frappe.throw(_("The clarification reference is invalid"), frappe.ValidationError)
+    if not reply or len(reply) > MAX_CLARIFICATION_REPLY_CHARS:
+        frappe.throw(_("A clarification reply must be at most {0} characters").format(MAX_CLARIFICATION_REPLY_CHARS), frappe.ValidationError)
+    if frappe.db.db_type == "sqlite":
+        frappe.db.sql("select name from `tabMuster Ask Turn` where name=%s", turn_id)
+    else:
+        frappe.db.sql("select name from `tabMuster Ask Turn` where name=%s for update", turn_id)
+    parent = frappe.get_doc("Muster Ask Turn", turn_id)
+    if parent.requested_by != user or parent.conversation_id != conversation or not parent.has_permission("read"):
+        frappe.throw(_("This clarification is unavailable"), frappe.PermissionError)
+    if parent.status != "Offered" or now_datetime() >= get_datetime(parent.expires_at):
+        frappe.throw(_("This clarification has expired"), frappe.ValidationError)
+    if (
+        not parent.clarification_token_hash or not parent.clarification_expires_at
+        or now_datetime() >= get_datetime(parent.clarification_expires_at)
+        or parent.clarification_handoff_id != handoff_id
+        or parent.prompt_hash != prompt_hash
+        or not secrets.compare_digest(parent.clarification_token_hash, _hash_text(token))
+    ):
+        frappe.throw(_("This clarification is unavailable or has expired"), frappe.ValidationError)
+    original = parent.get_password("prompt_secret")
+    original_scope = json.loads(parent.scope_json or "{}")
+    if _hash_text(original) != parent.prompt_hash or _hash_text(_canonical(original_scope)) != parent.scope_hash:
+        frappe.throw(_("The original Ask request no longer matches its evidence"), frappe.ValidationError)
+    if _canonical(submitted_scope) != _canonical(original_scope):
+        frappe.throw(_("The clarification must keep the original visible page context"), frappe.ValidationError)
+    if parent.clarification_kind == "missing_detail":
+        question = _safe_clarification_reason(parent.clarification_reason)
+        merged = (
+            f"{original}\n\nClarification requested by Muster:\n{question}"
+            f"\n\nUser's answer to that clarification:\n{reply}"
+        )
+    else:
+        merged = f"{original}\n\nClarification supplied by the user:\n{reply}"
+    if len(merged) > MAX_MERGED_OBJECTIVE_CHARS:
+        frappe.throw(_("The clarified request exceeds Muster's safe size limit"), frappe.ValidationError)
+    lineage = {
+        "parent_turn_id": parent.name,
+        "handoff_id": handoff_id,
+        "reply_hash": _hash_text(reply),
+    }
+    verified_target = _verified_exact_record(parent, reply, user, conversation)
+    if verified_target:
+        lineage.update(verified_target)
+    if parent.clarification_consumed_at:
+        child = frappe.get_doc("Muster Ask Turn", parent.clarification_child_turn) if parent.clarification_child_turn else None
+        if (
+            not child or child.request_id != key or child.requested_by != user
+            or child.conversation_id != conversation or child.prompt_hash != _hash_text(merged)
+            or child.parent_ask_turn != parent.name or child.parent_handoff_id != handoff_id
+            or child.clarification_reply_hash != lineage["reply_hash"]
+            or (child.verified_target_evidence_hash or None) != (lineage.get("verified_target_evidence_hash") or None)
+        ):
+            frappe.throw(_("This clarification reply was already used"), frappe.ValidationError)
+    return merged, original_scope, lineage, parent
+
+
+def _verified_turn_record_identity(turn, user: str) -> dict[str, str] | None:
+    fields = [
+        turn.verified_target_doctype, turn.verified_target_name,
+        turn.verified_target_action, turn.verified_target_at,
+        turn.verified_target_evidence_hash,
+    ]
+    if not any(fields):
+        return None
+    text_fields = [
+        turn.verified_target_doctype, turn.verified_target_name,
+        turn.verified_target_action, turn.verified_target_evidence_hash,
+    ]
+    if not all(isinstance(value, str) and value for value in text_fields) or not turn.verified_target_at or not turn.parent_ask_turn:
+        frappe.throw(_("The verified record identity evidence is incomplete"), frappe.ValidationError)
+    if turn.requested_by != user or turn.verified_target_action not in {"update", "delete"}:
+        frappe.throw(_("The verified record identity is unavailable"), frappe.PermissionError)
+    parent = frappe.get_doc("Muster Ask Turn", turn.parent_ask_turn)
+    if _exact_record_continuation_intent(parent, f"intent-{'0' * 32}") is None:
+        frappe.throw(_("The verified record identity no longer matches its Ask lineage"), frappe.ValidationError)
+    if (
+        parent.requested_by != user or parent.conversation_id != turn.conversation_id
+        or parent.scope_hash != turn.scope_hash
+        or turn.clarification_reply_hash != _hash_text(turn.verified_target_name)
+    ):
+        frappe.throw(_("The verified record identity no longer matches its Ask lineage"), frappe.ValidationError)
+    evidence = {
+        "schema_version": 1, "parent_turn_id": parent.name,
+        "parent_prompt_hash": parent.prompt_hash, "reply_hash": turn.clarification_reply_hash,
+        "user": user, "conversation_id": turn.conversation_id,
+        "action": turn.verified_target_action, "doctype": turn.verified_target_doctype,
+        "record_name": turn.verified_target_name, "verified_at": str(turn.verified_target_at),
+    }
+    if not secrets.compare_digest(turn.verified_target_evidence_hash, _hash_text(_canonical(evidence))):
+        frappe.throw(_("The verified record identity evidence no longer matches"), frappe.ValidationError)
+    permission = "write" if turn.verified_target_action == "update" else "delete"
+    if (
+        not frappe.db.exists("DocType", turn.verified_target_doctype)
+        or not frappe.db.exists(turn.verified_target_doctype, turn.verified_target_name)
+        or not frappe.has_permission(turn.verified_target_doctype, "read", doc=turn.verified_target_name, user=user)
+        or not frappe.has_permission(turn.verified_target_doctype, permission, doc=turn.verified_target_name, user=user)
+    ):
+        frappe.throw(_("The verified record is no longer available for this action"), frappe.PermissionError)
+    return {
+        "doctype": turn.verified_target_doctype,
+        "record_name": turn.verified_target_name,
+        "action": turn.verified_target_action,
+        "evidence_hash": turn.verified_target_evidence_hash,
+    }
 
 
 def _merge_form_evidence(context: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -255,6 +672,10 @@ def submit(
     conversation_id: str,
     scope: str | dict | None = None,
     idempotency_key: str | None = None,
+    clarification_turn_id: str | None = None,
+    clarification_handoff_id: str | None = None,
+    clarification_token: str | None = None,
+    clarification_prompt_hash: str | None = None,
 ) -> dict[str, Any]:
     """Queue a universal, read-safe Muster turn under the live Frappe user."""
     _require_post()
@@ -264,8 +685,18 @@ def submit(
         frappe.throw(_("Ask Muster requires a prompt of at most {0} characters").format(MAX_PROMPT_CHARS), frappe.ValidationError)
     conversation = _conversation(conversation_id)
     key = _idempotency_key(idempotency_key)
-    client, headers, binding = _client_for_user(user)
     requested_scope = _scope(scope)
+    continuation = _clarification_lineage(
+        user=user, conversation=conversation, key=key, reply=text,
+        submitted_scope=requested_scope, turn_id=clarification_turn_id,
+        handoff_id=clarification_handoff_id, token=clarification_token,
+        prompt_hash=clarification_prompt_hash,
+    )
+    lineage = None
+    parent_turn = None
+    if continuation:
+        text, requested_scope, lineage, parent_turn = continuation
+    client, headers, binding = _client_for_user(user)
     context = permission_filtered_context(requested_scope, user)
     intent_request_id = f"intent-{sha256(f'{user}:{conversation}:{key}'.encode()).hexdigest()[:32]}"
     prior_name = frappe.db.get_value("Muster Ask Turn", {"request_id": key}, "name")
@@ -275,6 +706,17 @@ def submit(
         scope_hash = _hash_text(_canonical(requested_scope))
         if turn.requested_by != user or turn.conversation_id != conversation or turn.prompt_hash != prompt_hash or turn.scope_hash != scope_hash:
             frappe.throw(_("This Ask idempotency key was already used for another request"), frappe.ValidationError)
+        if (
+            (turn.parent_ask_turn or None) != ((lineage or {}).get("parent_turn_id") or None)
+            or (turn.parent_handoff_id or None) != ((lineage or {}).get("handoff_id") or None)
+            or (turn.clarification_reply_hash or None) != ((lineage or {}).get("reply_hash") or None)
+            or (turn.verified_target_doctype or None) != ((lineage or {}).get("verified_target_doctype") or None)
+            or (turn.verified_target_name or None) != ((lineage or {}).get("verified_target_name") or None)
+            or (turn.verified_target_action or None) != ((lineage or {}).get("verified_target_action") or None)
+            or (str(turn.verified_target_at) if turn.verified_target_at else None) != ((lineage or {}).get("verified_target_at") or None)
+            or (turn.verified_target_evidence_hash or None) != ((lineage or {}).get("verified_target_evidence_hash") or None)
+        ):
+            frappe.throw(_("This Ask idempotency key does not match the clarification lineage"), frappe.ValidationError)
         outcomes = json.loads(turn.outcomes_json or "[]")
         handoffs = json.loads(turn.handoffs_json or "[]")
         if (
@@ -286,27 +728,43 @@ def submit(
             frappe.throw(_("Stored Ask routing evidence is invalid"), frappe.ValidationError)
         intent = {"outcomes": outcomes, "clarification": turn.clarification or None}
     else:
-        classified = client.request(
-            "POST",
-            ASK_INTENTS_PATH,
-            payload={
-                "schemaVersion": 1,
-                "requestId": intent_request_id,
-                "prompt": text,
-                "context": {key: value for key, value in context.items() if key != "summary"},
-            },
-            idempotency_key=f"{intent_request_id}-route",
-            headers=headers,
+        inherited = _exact_record_continuation_intent(parent_turn, intent_request_id)
+        if inherited:
+            intent = {"outcomes": inherited["outcomes"], "clarification": None}
+            handoffs = inherited["handoffs"]
+        else:
+            classified = client.request(
+                "POST",
+                ASK_INTENTS_PATH,
+                payload={
+                    "schemaVersion": 1,
+                    "requestId": intent_request_id,
+                    "prompt": text,
+                    "context": {key: value for key, value in context.items() if key != "summary"},
+                },
+                idempotency_key=f"{intent_request_id}-route",
+                headers=headers,
+            )
+            intent = _validated_intent(classified, intent_request_id)
+            handoffs = _handoffs(intent["outcomes"], intent_request_id)
+        turn = _ask_turn(
+            user, conversation, key, text, requested_scope, intent["outcomes"], handoffs,
+            intent["clarification"], lineage=lineage,
         )
-        intent = _validated_intent(classified, intent_request_id)
-        handoffs = _handoffs(intent["outcomes"], intent_request_id)
-        turn = _ask_turn(user, conversation, key, text, requested_scope, intent["outcomes"], handoffs, intent["clarification"])
+    if parent_turn and not parent_turn.clarification_consumed_at:
+        parent_turn.db_set({
+            "clarification_consumed_at": now_datetime(),
+            "clarification_child_turn": turn.name,
+        }, update_modified=False)
     if intent["clarification"]:
+        clarification = _issue_clarification(turn, "intent", intent["clarification"])
         return {
             "status": "clarification",
-            "reason": intent["clarification"],
+            "reason": _safe_clarification_reason(intent["clarification"]),
             "turn_id": turn.name,
             "handoffs": [],
+            "continuation": clarification,
+            **({"merged_objective": text} if lineage else {}),
         }
     form_evidence = False
     selected_doctype = str(requested_scope.get("doctype") or "").strip()
@@ -363,6 +821,9 @@ def submit(
         "requestId": intent_request_id,
         "requestedOutcomes": intent["outcomes"],
     }}
+    fast_reply = _effectful_fast_reply(intent["outcomes"])
+    if fast_reply:
+        context["fastReply"] = fast_reply
     response = client.request(
         "POST",
         ASYNC_PATH,
@@ -392,6 +853,7 @@ def submit(
         "replayed": bool(response.get("replayed")),
         "turn_id": turn.name,
         "handoffs": handoffs,
+        **({"merged_objective": text} if lineage else {}),
     }
 
 
@@ -403,6 +865,7 @@ def accept_handoff(
     idempotency_key: str | None = None,
     development_app: str | None = None,
     policy: str | None = None,
+    source_file: str | None = None,
 ) -> dict[str, Any]:
     """Accept one inert next step; acceptance never publishes, starts, or executes it."""
     _require_post()
@@ -432,6 +895,8 @@ def accept_handoff(
             "proposal_doctype": "Muster Development Proposal" if selected.get("kind") == "development_workflow" else "Muster Workflow Proposal",
             "status": "Proposed", "replayed": True, "executed": False,
         }
+    if turn.clarification_consumed_at:
+        frappe.throw(_("This Ask handoff was replaced by its clarified request"), frappe.ValidationError)
     if turn.status != "Offered" or now_datetime() >= get_datetime(turn.expires_at):
         if turn.status == "Offered":
             turn.db_set("status", "Expired", update_modified=False)
@@ -447,15 +912,35 @@ def accept_handoff(
         if not development_app or not policy:
             frappe.throw(_("Select a registered app and enabled policy for this development proposal"), frappe.ValidationError)
         from muster.api.development import create_from_ask_turn
-        proposal = create_from_ask_turn(turn, development_app, policy, proposal_key)
+        proposal = create_from_ask_turn(
+            turn, development_app, policy, proposal_key, source_file=source_file,
+        )
+        if proposal.get("status") == "clarification":
+            clarification = _issue_clarification(turn, handoff_id, proposal["reason"])
+            return {
+                "turn_id": turn.name, "handoff_id": handoff_id,
+                "status": "clarification", "reason": _safe_clarification_reason(proposal["reason"]),
+                "continuation": clarification,
+                "replayed": False, "executed": False,
+            }
         link_field = "development_proposal"
         proposal_doctype = "Muster Development Proposal"
     else:
         from muster.orchestration.workflow_proposal import request_workflow_proposal
+        verified_record_identity = _verified_turn_record_identity(turn, user)
         proposal = request_workflow_proposal(
             prompt, requested_scope, proposal_key,
             preferred_handoff_kind=selected.get("kind"),
+            verified_record_identity=verified_record_identity,
         )
+        if proposal.get("status") == "clarification":
+            clarification = _issue_clarification(turn, handoff_id, proposal["reason"])
+            return {
+                "turn_id": turn.name, "handoff_id": handoff_id,
+                "status": "clarification", "reason": _safe_clarification_reason(proposal["reason"]),
+                "continuation": clarification,
+                "replayed": False, "executed": False,
+            }
         link_field = "workflow_proposal"
         proposal_doctype = "Muster Workflow Proposal"
     turn.db_set({
@@ -486,14 +971,14 @@ def poll(run_id: str, wait_ms: int | str = 0) -> dict[str, Any]:
     if status not in {"queued", "running", "completed", "failed"} or response.get("runId") != run_id:
         frappe.throw(_("The gateway returned an invalid Ask Muster status"), frappe.ValidationError)
     result: dict[str, Any] = {"run_id": run_id, "status": status}
-    partial = response.get("partialText")
-    if isinstance(partial, str):
-        result["partial_text"] = partial[:64_000]
+    tool_calls = _presentable_tool_calls(response.get("toolCalls"))
+    if tool_calls:
+        result["tool_calls"] = tool_calls
     if status == "completed":
         reply = response.get("reply")
         if not isinstance(reply, dict) or not isinstance(reply.get("text"), str):
             frappe.throw(_("The gateway returned an invalid Ask Muster answer"), frappe.ValidationError)
-        result["answer"] = reply["text"][:64_000]
+        result["answer"] = _presentable_answer(reply["text"])
         artifacts = []
         for index, artifact in enumerate(reply.get("artifacts") or []):
             if not isinstance(artifact, dict):

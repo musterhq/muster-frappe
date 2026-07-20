@@ -20,7 +20,7 @@ class _Row(dict):
 class TestEffectiveFormSchema(FrappeTestCase):
     def _meta(self):
         return SimpleNamespace(
-            permissions=[_Row(role="Sales User", permlevel=0, read=1, write=1)],
+            permissions=[_Row(role="Sales User", permlevel=0, read=1, create=1, write=1)],
             fields=[
                 _Row(fieldname="customer_name", label="Customer Name", fieldtype="Data", permlevel=0, reqd=1, read_only=0, hidden=0, options=None),
                 _Row(fieldname="custom_service_tier", label="Service Tier", fieldtype="Select", permlevel=0, reqd=1, read_only=1, hidden=0, options="Gold\nSilver"),
@@ -80,15 +80,95 @@ class TestEffectiveFormSchema(FrappeTestCase):
         levels = form_schema._permission_levels(meta, {"System Manager"}, "write", "Administrator")
         self.assertEqual(levels, {0, 1})
 
+    def test_create_only_role_can_fill_create_fields_without_update_authority(self):
+        meta = self._meta()
+        meta.permissions = [_Row(role="Intake User", permlevel=0, read=1, create=1, write=0)]
+
+        def exists(doctype, name=None):
+            return doctype == "DocType" and name == "Customer"
+
+        def permission(_doctype, permission_type, **_kwargs):
+            return permission_type in {"read", "create"}
+
+        with (
+            patch.object(frappe.db, "exists", side_effect=exists),
+            patch.object(frappe.db, "get_value", return_value="2026-07-20"),
+            patch.object(frappe, "has_permission", side_effect=permission),
+            patch.object(frappe, "get_meta", return_value=meta),
+            patch.object(frappe, "get_roles", return_value=["Intake User"]),
+            patch.object(frappe, "get_all", return_value=[]),
+        ):
+            snapshot = form_schema.effective_form_schema("Customer", user="intake@example.test")
+        customer_name = next(field for field in snapshot["fields"] if field["fieldname"] == "customer_name")
+        self.assertTrue(customer_name["create_writable"])
+        self.assertFalse(customer_name["update_writable"])
+        self.assertTrue(customer_name["writable"])
+
+    def test_only_nonempty_effective_defaults_satisfy_required_fields(self):
+        self.assertFalse(form_schema._has_effective_default(None))
+        self.assertFalse(form_schema._has_effective_default("  "))
+        self.assertTrue(form_schema._has_effective_default("Company"))
+        self.assertTrue(form_schema._has_effective_default(0))
+
+    def test_only_effective_meta_default_is_authoritative_not_raw_property_setter_evidence(self):
+        meta = self._meta()
+        meta.fields[0]["default"] = "  "
+        meta.fields[1]["default"] = "Company"
+        setters = [{
+            "name": "Customer-customer_name-default", "field_name": "customer_name",
+            "property": "default", "value": "UNAPPLIED RAW VALUE", "property_type": "Data",
+            "modified": "2026-07-20",
+        }]
+
+        def exists(doctype, name=None):
+            return doctype == "DocType" and name in {"Customer", "Property Setter"}
+
+        def get_all(doctype, **_kwargs):
+            return setters if doctype == "Property Setter" else []
+
+        with (
+            patch.object(frappe.db, "exists", side_effect=exists),
+            patch.object(frappe.db, "get_value", return_value="2026-07-20"),
+            patch.object(frappe, "has_permission", return_value=True),
+            patch.object(frappe, "get_meta", return_value=meta),
+            patch.object(frappe, "get_roles", return_value=["Sales User"]),
+            patch.object(frappe, "get_all", side_effect=get_all),
+        ):
+            snapshot = form_schema.effective_form_schema("Customer", user="sales@example.test")
+
+        by_name = {field["fieldname"]: field for field in snapshot["fields"]}
+        self.assertFalse(by_name["customer_name"]["has_default"], "raw setter rows cannot satisfy a required field")
+        self.assertTrue(by_name["custom_service_tier"]["has_default"], "Frappe's effective Meta default is authoritative")
+        self.assertEqual(by_name["customer_name"]["provenance"]["property_setters"][0]["property"], "default")
+
     def test_stale_hash_and_unsupported_lifecycle_never_reach_browser_execution(self):
         snapshot = {
             "doctype": "Customer", "schema_hash": "a" * 64, "revision": "b" * 64,
-            "authority": {"read": True, "create": True, "write": True}, "fields": [],
+            "authority": {"read": True, "create": True, "write": True, "delete": True}, "fields": [],
         }
         binding = {"doctype": "Customer", "schema_hash": "c" * 64, "revision": "b" * 64, "operation": "read", "fields": [], "record_name": None}
         with patch.object(form_schema, "effective_form_schema", return_value=snapshot):
             with self.assertRaisesRegex(form_schema.MusterFormSchemaError, "changed"):
                 form_schema.assert_form_schema_binding(binding, user="sales@example.test")
-            for operation in ("delete", "submit", "cancel"):
+            for operation in ("submit", "cancel"):
                 with self.assertRaisesRegex(form_schema.MusterFormSchemaError, "not supported"):
                     form_schema.assert_form_schema_binding({**binding, "operation": operation}, user="sales@example.test")
+
+    def test_delete_binding_requires_live_record_permission_and_no_fields(self):
+        snapshot = {
+            "doctype": "Customer", "schema_hash": "a" * 64, "revision": "b" * 64,
+            "authority": {"read": True, "create": True, "write": True, "delete": True}, "fields": [],
+        }
+        binding = {"doctype": "Customer", "schema_hash": "a" * 64, "revision": "b" * 64, "operation": "delete", "fields": [], "record_name": "ACME"}
+        with (
+            patch.object(form_schema, "effective_form_schema", return_value=snapshot),
+            patch.object(frappe, "has_permission", return_value=True) as permission,
+        ):
+            form_schema.assert_form_schema_binding(binding, user="sales@example.test")
+        permission.assert_called_with("Customer", "delete", doc="ACME", user="sales@example.test")
+        with patch.object(form_schema, "effective_form_schema", return_value=snapshot), patch.object(frappe, "has_permission", return_value=True):
+            with self.assertRaisesRegex(form_schema.MusterFormSchemaError, "cannot bind editable fields"):
+                form_schema.assert_form_schema_binding({**binding, "fields": ["customer_name"]}, user="sales@example.test")
+        with patch.object(form_schema, "effective_form_schema", return_value={**snapshot, "authority": {**snapshot["authority"], "delete": False}}):
+            with self.assertRaisesRegex(form_schema.MusterFormSchemaError, "Delete permission"):
+                form_schema.assert_form_schema_binding(binding, user="sales@example.test")

@@ -9,7 +9,7 @@ description = "Governed AI automation operating system for Frappe"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dynamic = ["version"]
-dependencies = ["requests>=2.32,<3"]
+dependencies = ["pypdf>=5,<7", "requests>=2.32,<3"]
 license = {text = "AGPL-3.0-or-later"}
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -20,7 +20,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://themuster.dev"
-Repository = "https://github.com/Dkm0315/muster"
+Repository = "https://github.com/musterhq/muster-frappe"
 
 [tool.ruff]
 line-length = 100

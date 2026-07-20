@@ -62,6 +62,7 @@ class TestDemoPlan(unittest.TestCase):
         self.assertEqual(
             profile.expected_counts(),
             {
+                "companies": 4,
                 "customers": 1_000,
                 "suppliers": 500,
                 "employees": 300,
@@ -70,7 +71,7 @@ class TestDemoPlan(unittest.TestCase):
                 "crm_deals": 750,
             },
         )
-        self.assertEqual(profile.total, 4_550)
+        self.assertEqual(profile.total, 4_554)
 
     def test_acceptance_principals_are_distinct_and_roles_are_balanced(self):
         manifest = build_manifest("tenant-a.test", "frappeverse", "acceptance")

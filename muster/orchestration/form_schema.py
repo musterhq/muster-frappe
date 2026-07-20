@@ -40,9 +40,11 @@ def effective_form_schema(doctype: str, *, user: str | None = None) -> dict[str,
     meta = frappe.get_meta(doctype, cached=False)
     roles = set(frappe.get_roles(actor))
     read_levels = _permission_levels(meta, roles, "read", actor)
+    create_levels = _permission_levels(meta, roles, "create", actor)
     write_levels = _permission_levels(meta, roles, "write", actor)
     can_create = bool(frappe.has_permission(doctype, "create", user=actor))
     can_write = bool(frappe.has_permission(doctype, "write", user=actor))
+    can_delete = bool(frappe.has_permission(doctype, "delete", user=actor))
 
     custom_fields = _rows(
         "Custom Field", {"dt": doctype},
@@ -79,7 +81,9 @@ def effective_form_schema(doctype: str, *, user: str | None = None) -> dict[str,
             continue
         permlevel = int(field.permlevel or 0)
         readable = permlevel in read_levels
-        writable = bool(can_write and permlevel in write_levels and not field.read_only and not field.hidden)
+        create_writable = bool(can_create and permlevel in create_levels and not field.read_only and not field.hidden)
+        update_writable = bool(can_write and permlevel in write_levels and not field.read_only and not field.hidden)
+        writable = create_writable or update_writable
         if not readable:
             continue
         custom = custom_by_name.get(field.fieldname)
@@ -90,11 +94,13 @@ def effective_form_schema(doctype: str, *, user: str | None = None) -> dict[str,
             "options": _safe_options(field.options),
             "permlevel": permlevel,
             "required": bool(field.reqd),
-            "has_default": field.default is not None,
+            "has_default": _has_effective_default(field.default),
             "read_only": bool(field.read_only),
             "hidden": bool(field.hidden),
             "readable": True,
             "writable": writable,
+            "create_writable": create_writable,
+            "update_writable": update_writable,
             "provenance": {
                 "source": "custom_field" if custom else "doctype_field",
                 **({"custom_field": custom.get("name")} if custom else {}),
@@ -108,7 +114,7 @@ def effective_form_schema(doctype: str, *, user: str | None = None) -> dict[str,
         "schema_version": 1,
         "doctype": doctype,
         "actor": actor,
-        "authority": {"read": True, "create": can_create, "write": can_write},
+        "authority": {"read": True, "create": can_create, "write": can_write, "delete": can_delete},
         "fields": sorted(fields, key=lambda item: item["fieldname"]),
         "doctype_property_setters": sorted(doctype_setters, key=lambda item: str(item.get("name") or "")),
         "workflow": workflow,
@@ -141,8 +147,8 @@ def effective_form_schema(doctype: str, *, user: str | None = None) -> dict[str,
 def assert_form_schema_binding(binding: dict[str, Any], *, user: str | None = None) -> dict[str, Any]:
     if not isinstance(binding, dict) or set(binding) != {"doctype", "schema_hash", "revision", "operation", "fields", "record_name"}:
         raise MusterFormSchemaError(_("The attended form schema binding is invalid"))
-    if binding.get("operation") not in {"create", "read", "update"}:
-        raise MusterFormSchemaError(_("Delete, submit and cancel are not supported by attended CRUD"))
+    if binding.get("operation") not in {"create", "read", "update", "delete"}:
+        raise MusterFormSchemaError(_("Submit and cancel are not supported by attended CRUD"))
     snapshot = effective_form_schema(binding.get("doctype"), user=user)
     if not _constant(snapshot["schema_hash"], binding.get("schema_hash")) or not _constant(snapshot["revision"], binding.get("revision")):
         raise MusterFormSchemaError(_("The form customization changed after review"))
@@ -151,18 +157,28 @@ def assert_form_schema_binding(binding: dict[str, Any], *, user: str | None = No
         raise MusterFormSchemaError(_("The attended form fields are invalid"))
     available = {field["fieldname"]: field for field in snapshot["fields"]}
     operation = binding["operation"]
+    if operation == "delete" and requested:
+        raise MusterFormSchemaError(_("Delete review cannot bind editable fields"))
     for name in requested:
         field = available.get(name)
-        if not field or (operation in {"create", "update"} and not field["writable"]):
+        allowed = field and (
+            (operation == "create" and field.get("create_writable", field["writable"]))
+            or (operation == "update" and field.get("update_writable", field["writable"]))
+            or operation not in {"create", "update"}
+        )
+        if not allowed:
             raise MusterFormSchemaError(_("A planned form field is no longer available"))
     if operation == "create" and not snapshot["authority"]["create"]:
         raise MusterFormSchemaError(_("Create permission is no longer available"))
     if operation == "update" and not snapshot["authority"]["write"]:
         raise MusterFormSchemaError(_("Write permission is no longer available"))
+    if operation == "delete" and not snapshot["authority"]["delete"]:
+        raise MusterFormSchemaError(_("Delete permission is no longer available"))
     record_name = binding.get("record_name")
-    if operation == "update":
-        if not isinstance(record_name, str) or not record_name or not frappe.has_permission(snapshot["doctype"], "write", doc=record_name, user=user or frappe.session.user):
-            raise MusterFormSchemaError(_("The record is no longer writable"))
+    if operation in {"update", "delete"}:
+        permission = "write" if operation == "update" else "delete"
+        if not isinstance(record_name, str) or not record_name or not frappe.has_permission(snapshot["doctype"], permission, doc=record_name, user=user or frappe.session.user):
+            raise MusterFormSchemaError(_("The record is no longer available for this action"))
     elif operation == "read" and record_name is not None:
         if not isinstance(record_name, str) or not record_name or not frappe.has_permission(snapshot["doctype"], "read", doc=record_name, user=user or frappe.session.user):
             raise MusterFormSchemaError(_("The record is no longer readable"))
@@ -217,6 +233,15 @@ def _safe_options(value: Any) -> str | None:
     if not isinstance(value, str) or len(value) > 4000:
         return None
     return value
+
+
+def _has_effective_default(value: Any) -> bool:
+    """An empty textual default does not satisfy a mandatory form field."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
 
 
 def _digest(value: Any) -> str:

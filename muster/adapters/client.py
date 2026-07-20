@@ -96,6 +96,7 @@ class GatewayClient:
         params: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         headers: dict[str, str] | None = None,
+        read_timeout: float = 30,
     ) -> dict[str, Any]:
         if (
             not path.startswith("/")
@@ -108,6 +109,8 @@ class GatewayClient:
         forbidden_headers = {"authorization", "host", "content-length", "transfer-encoding"}
         if any(name.lower() in forbidden_headers for name in (headers or {})):
             raise GatewayClientError(_("A protected gateway header cannot be overridden"))
+        if not isinstance(read_timeout, (int, float)) or isinstance(read_timeout, bool) or read_timeout < 1 or read_timeout > 300:
+            raise GatewayClientError(_("Gateway read timeout is outside the safe range"))
         request_headers = {
             "Authorization": f"Bearer {self.binding.bearer}",
             "Accept": "application/json",
@@ -123,7 +126,7 @@ class GatewayClient:
                 json=payload,
                 params=params,
                 headers=request_headers,
-                timeout=(3.05, 30),
+                timeout=(3.05, read_timeout),
                 allow_redirects=False,
                 verify=True,
                 stream=True,

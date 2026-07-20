@@ -46,7 +46,7 @@ def mission_query(user: str | None = None) -> str:
 
 def workflow_proposal_query(user: str | None = None) -> str:
     user = user or frappe.session.user
-    if set(frappe.get_roles(user)) & GLOBAL_READ_ROLES:
+    if set(frappe.get_roles(user)) & (GLOBAL_READ_ROLES | {"Muster Approver"}):
         return ""
     return f"`tabMuster Workflow Proposal`.`requested_by` = {_escape(user)}"
 
@@ -150,6 +150,8 @@ def workflow_proposal_has_permission(doc, user=None, ptype=None, debug=False):
     if "Muster Auditor" in roles:
         return permission_type in {"read", "select", "report", "export", "print"}
     if "Muster Automation Manager" in roles:
+        return permission_type in {"read", "select", "write", "report", "export", "print"}
+    if "Muster Approver" in roles:
         return permission_type in {"read", "select", "write", "report", "export", "print"}
     if not doc:
         return False

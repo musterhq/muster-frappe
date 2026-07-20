@@ -4,13 +4,14 @@ import copy
 import json
 from hashlib import sha256
 from uuid import uuid4
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import frappe
 from frappe.tests import IntegrationTestCase
 
 from muster.adapters.client import GatewayClientError
 from muster.orchestration.workflow_proposal import (
+    WorkflowProposalClarification,
     WorkflowProposalError,
     validate_compiled_graph,
     validate_workflow_descriptor,
@@ -20,6 +21,14 @@ from muster.orchestration.workflow_proposal import publish_approved_proposal
 from muster.orchestration.workflow_proposal import start_published_proposal_mission
 from muster.orchestration.workflow_proposal import _materialize_attended_crud_bundle
 from muster.orchestration.workflow_proposal import _attended_form_catalogs
+from muster.orchestration.workflow_proposal import _attended_preview_projection
+from muster.orchestration.workflow_proposal import assert_attended_update_revision
+from muster.orchestration.workflow_proposal import preflight_attended_proposal_save
+from muster.orchestration.workflow_proposal import assert_attended_delete_revision
+from muster.orchestration.workflow_proposal import assert_destructive_reviewer
+from muster.orchestration.workflow_proposal import assert_attended_reviewer
+from muster.orchestration.workflow_proposal import _destructive_proof_value
+from muster.orchestration.workflow_proposal import _canonical_requested_scope
 
 
 def descriptor():
@@ -81,6 +90,23 @@ def compiled_graph():
 
 
 class TestWorkflowProposalValidation(IntegrationTestCase):
+    def test_native_surface_doctype_is_strict_scope_ceiling(self):
+        snapshot = {
+            "doctype": "CRM Lead", "schema_hash": "a" * 64, "revision": "b" * 64,
+            "authority": {"read": True, "create": True, "write": True}, "fields": [],
+        }
+        with (
+            patch("muster.orchestration.workflow_proposal.frappe.get_all") as discovery,
+            patch("muster.orchestration.workflow_proposal.effective_form_schema", return_value=snapshot),
+        ):
+            catalogs = _attended_form_catalogs(
+                {"source": "spa-assistant", "route": "/crm/leads/view/list", "doctype": "CRM Lead"},
+                "sales@example.test",
+                "Create a CRM Lead with First Name Ada and Status New",
+            )
+        self.assertEqual([catalog["doctype"] for catalog in catalogs], ["CRM Lead"])
+        discovery.assert_not_called()
+
     def test_home_page_create_uses_bounded_host_discovery_not_current_page_as_scope_ceiling(self):
         snapshot = {"doctype": "Customer", "schema_hash": "a" * 64, "revision": "b" * 64, "authority": {"read": True, "create": True, "write": True}, "fields": [{"fieldname": "customer_name", "label": "Customer Name", "fieldtype": "Data", "required": True, "has_default": False, "writable": True}]}
         with (
@@ -92,12 +118,175 @@ class TestWorkflowProposalValidation(IntegrationTestCase):
         self.assertIn("create", catalogs[0]["actions"])
         self.assertLessEqual(discovery.call_args.kwargs["limit_page_length"], 50)
 
+    def test_catalog_preserves_effective_customization_evidence_and_rejects_ambiguous_record_scope(self):
+        snapshot = {
+            "doctype": "Customer", "schema_hash": "a" * 64, "revision": "b" * 64,
+            "authority": {"read": True, "create": True, "write": True},
+            "doctype_property_setters": [{"name": "Customer-autoname"}],
+            "fields": [{
+                "fieldname": "custom_service_tier", "label": "Service Tier", "fieldtype": "Select",
+                "required": True, "has_default": False, "writable": True,
+                "provenance": {"source": "custom_field", "property_setters": [{"name": "mandatory-tier"}]},
+            }],
+        }
+        scope = {
+            "doctype": "Customer", "documents": [
+                {"doctype": "Customer", "name": "ACME"},
+                {"doctype": "Customer", "name": "BETA"},
+            ],
+        }
+        with (
+            patch("muster.orchestration.workflow_proposal.frappe.get_all", return_value=[]),
+            patch("muster.orchestration.workflow_proposal.effective_form_schema", return_value=snapshot),
+        ):
+            catalog = _attended_form_catalogs(scope, "sales@example.test", "Update the Customer")[0]
+        self.assertEqual(catalog["record_identity_state"], "ambiguous")
+        self.assertIsNone(catalog["record_name"])
+        self.assertNotIn("update", catalog["actions"])
+        self.assertEqual(catalog["doctype_property_setter_count"], 1)
+        self.assertEqual(catalog["fields"][0]["source"], "custom_field")
+        self.assertEqual(catalog["fields"][0]["property_setter_count"], 1)
+
+    def test_prompt_record_name_cannot_silently_override_ambiguous_scope(self):
+        snapshot = {
+            "doctype": "Customer", "schema_hash": "a" * 64, "revision": "b" * 64,
+            "authority": {"read": True, "create": True, "write": True, "delete": True},
+            "fields": [],
+        }
+        scope = {
+            "doctype": "Customer", "documents": [
+                {"doctype": "Customer", "name": "ACME"},
+                {"doctype": "Customer", "name": "BETA"},
+            ],
+        }
+        with patch("muster.orchestration.workflow_proposal.effective_form_schema", return_value=snapshot):
+            catalog = _attended_form_catalogs(
+                scope, "sales@example.test", "Update the Customer. The missing record is ACME",
+            )[0]
+        self.assertEqual(catalog["record_identity_state"], "ambiguous")
+        self.assertIsNone(catalog["record_name"])
+        self.assertNotIn("update", catalog["actions"])
+
+    def test_verified_exact_record_evidence_resolves_one_ambiguous_candidate(self):
+        snapshot = {
+            "doctype": "Customer", "schema_hash": "a" * 64, "revision": "b" * 64,
+            "authority": {"read": True, "create": True, "write": True, "delete": True},
+            "fields": [],
+        }
+        scope = {
+            "doctype": "Customer", "documents": [
+                {"doctype": "Customer", "name": "ACME"},
+                {"doctype": "Customer", "name": "BETA"},
+            ],
+        }
+        identity = {"doctype": "Customer", "record_name": "ACME", "action": "update", "evidence_hash": "c" * 64}
+        with (
+            patch("muster.orchestration.workflow_proposal.effective_form_schema", return_value=snapshot),
+            patch("muster.orchestration.workflow_proposal.frappe.db.exists", return_value=True),
+            patch("muster.orchestration.workflow_proposal.frappe.has_permission", return_value=True),
+        ):
+            catalog = _attended_form_catalogs(
+                scope, "sales@example.test", "Update the Customer. Clarification supplied by the user: ACME",
+                verified_record_identity=identity,
+            )[0]
+        self.assertEqual(catalog["record_identity_state"], "unique")
+        self.assertEqual(catalog["record_name"], "ACME")
+        self.assertIn("update", catalog["actions"])
+        self.assertEqual(scope["documents"][1]["name"], "BETA", "the original bound scope remains unchanged")
+
+    def test_scope_disambiguation_is_bounded_and_deduplicated(self):
+        duplicate = [{"doctype": "Customer", "name": "ACME"}] * 20
+        admitted = _canonical_requested_scope({"doctype": "Customer", "documents": duplicate})
+        self.assertEqual(admitted["documents"], [{"doctype": "Customer", "name": "ACME"}])
+        with self.assertRaisesRegex(WorkflowProposalError, "documents are invalid or excessive"):
+            _canonical_requested_scope({
+                "doctype": "Customer",
+                "documents": [{"doctype": "Customer", "name": f"CUST-{index:05d}"} for index in range(21)],
+            })
+
     def test_ambiguous_or_unmatched_home_target_fails_closed_before_proposal_materialization(self):
         with patch("muster.orchestration.workflow_proposal.frappe.get_all", return_value=[]):
             catalogs = _attended_form_catalogs({"source": "desk", "route": "/desk"}, "sales@example.test", "Create a new record")
         self.assertEqual(catalogs, [])
         with self.assertRaisesRegex(WorkflowProposalError, "Name a live-readable DocType"):
             _materialize_attended_crud_bundle(descriptor(), compiled_graph(), catalogs, ["frappe.browser.navigate"])
+
+    def test_update_without_unique_live_record_clarifies_before_gateway_planning(self):
+        frappe.set_user("Administrator")
+        client = Mock()
+        catalogs = [{
+            "doctype": "Customer", "record_name": None, "record_identity_state": "ambiguous",
+            "actions": ["read"], "authority": {"read": True, "create": True, "write": True},
+            "fields": [], "schema_hash": "a" * 64, "revision": "b" * 64,
+        }]
+        key = f"clarify-{uuid4().hex}"
+        with patch("muster.orchestration.workflow_proposal._attended_form_catalogs", return_value=catalogs):
+            result = request_workflow_proposal(
+                "Update the Customer", {"doctype": "Customer"}, key,
+                client=client, binding=Mock(), preferred_handoff_kind="attended_browser",
+            )
+        self.assertEqual(result["status"], "clarification")
+        self.assertEqual(result["reason"], "Which exact Customer record should I update?")
+        self.assertFalse(result["executed"])
+        client.request.assert_not_called()
+        self.assertFalse(frappe.db.exists("Muster Workflow Proposal", {"request_id": key}))
+
+    def test_delete_without_unique_live_record_clarifies_before_gateway_planning(self):
+        frappe.set_user("Administrator")
+        client = Mock()
+        catalogs = [{
+            "doctype": "Customer", "record_name": None, "record_identity_state": "ambiguous",
+            "actions": ["read"], "authority": {"read": True, "delete": True},
+            "fields": [], "schema_hash": "a" * 64, "revision": "b" * 64,
+        }]
+        key = f"clarify-delete-{uuid4().hex}"
+        with patch("muster.orchestration.workflow_proposal._attended_form_catalogs", return_value=catalogs):
+            result = request_workflow_proposal(
+                "Delete the Customer", {"doctype": "Customer"}, key,
+                client=client, binding=Mock(), preferred_handoff_kind="attended_browser",
+            )
+        self.assertEqual(result["status"], "clarification")
+        self.assertEqual(result["reason"], "Which exact Customer record should I delete?")
+        self.assertFalse(result["executed"])
+        client.request.assert_not_called()
+        self.assertFalse(frappe.db.exists("Muster Workflow Proposal", {"request_id": key}))
+
+    def test_missing_create_information_returns_structured_clarification_without_proposal(self):
+        frappe.set_user("Administrator")
+        client = Mock()
+        request_id = None
+
+        def proposed(_method, _path, **kwargs):
+            nonlocal request_id
+            request_id = kwargs["payload"]["requestId"]
+            return {
+                "schemaVersion": 1, "requestId": request_id, "status": "proposed",
+                "proposal": descriptor(), "graph": compiled_graph(), "run": None,
+            }
+
+        client.request.side_effect = proposed
+        key = f"create-clarify-{uuid4().hex}"
+        with (
+            patch("muster.orchestration.workflow_proposal.permission_filtered_context", return_value={}),
+            patch("muster.orchestration.workflow_proposal._attended_form_catalogs", return_value=[{
+                "doctype": "Customer", "record_name": None, "record_identity_state": "missing",
+                "actions": ["create"], "authority": {"read": True, "create": True, "write": True},
+                "fields": [], "schema_hash": "a" * 64, "revision": "b" * 64,
+            }]),
+            patch("muster.orchestration.workflow_proposal._caller_capabilities", return_value=["frappe.browser.navigate"]),
+            patch("muster.orchestration.workflow_proposal.run_authority_headers", return_value=({}, "csrf")),
+            patch("muster.orchestration.workflow_proposal._materialize_attended_crud_bundle", side_effect=WorkflowProposalClarification("What value should I use for Customer Name?")),
+        ):
+            result = request_workflow_proposal(
+                "Create a Customer", {"doctype": "Customer"}, key,
+                client=client, binding=Mock(), preferred_handoff_kind="attended_browser",
+            )
+        self.assertEqual(result, {
+            "status": "clarification", "reason": "What value should I use for Customer Name?",
+            "replayed": False, "executed": False,
+        })
+        self.assertIsNotNone(request_id)
+        self.assertFalse(frappe.db.exists("Muster Workflow Proposal", {"request_id": key}))
 
     def test_governed_record_change_compiles_to_host_bound_attended_crud(self):
         effect = {
@@ -118,7 +307,7 @@ class TestWorkflowProposalValidation(IntegrationTestCase):
             "schema_hash": "a" * 64, "revision": "b" * 64,
             "fields": [
                 {"fieldname": "customer_name", "label": "Customer Name", "fieldtype": "Data", "required": True, "has_default": False, "writable": True},
-                {"fieldname": "custom_service_tier", "label": "Service Tier", "fieldtype": "Select", "required": False, "has_default": False, "writable": True},
+                {"fieldname": "custom_service_tier", "label": "Service Tier", "fieldtype": "Select", "options": "Silver\nGold", "required": False, "has_default": False, "writable": True},
             ],
         }
         authority = ["frappe.record.update", "frappe.browser.navigate", "frappe.browser.fill", "frappe.browser.select", "frappe.browser.click"]
@@ -133,6 +322,27 @@ class TestWorkflowProposalValidation(IntegrationTestCase):
         self.assertEqual(plan["actions"][-1]["postcondition"]["kind"], "record_saved")
         self.assertFalse(any("schema_hash" in json.dumps(step.get("execution", {})) for step in proposal["steps"]), "provider output was not trusted to author hashes")
 
+        live_snapshot = {
+            "fields": [
+                {"fieldname": "customer_name", "label": "Customer Name", "writable": True},
+                {"fieldname": "custom_service_tier", "label": "Service Tier", "writable": True},
+            ],
+        }
+        proposal_doc = frappe._dict(name="MST-WFP-PREVIEW", objective="Update the customer", status="Proposed")
+        with (
+            patch("muster.orchestration.workflow_proposal.assert_form_schema_binding", return_value=live_snapshot),
+            patch("muster.orchestration.workflow_proposal.frappe.db.get_value", return_value="2026-07-20 10:11:12.123456"),
+        ):
+            preview = _attended_preview_projection(plan, "sales@example.test", proposal_doc)
+        self.assertEqual(preview["doctype"], "Customer")
+        self.assertEqual([field["label"] for field in preview["fields"]], ["Service Tier", "Customer Name"])
+        self.assertTrue(preview["save_requires_confirmation"])
+        self.assertEqual(preview["record_revision"], "2026-07-20 10:11:12.123456")
+        self.assertFalse(preview["save_authorized"])
+        self.assertFalse(preview["executed"])
+        self.assertNotIn("schema_hash", preview)
+        self.assertNotIn("actions", preview)
+
     def test_attended_compiler_rejects_model_fields_outside_live_catalog(self):
         effect = {
             "schemaVersion": 1, "capability": "frappe.record.update",
@@ -145,6 +355,328 @@ class TestWorkflowProposalValidation(IntegrationTestCase):
         catalog = {"doctype": "Customer", "record_name": "ACME", "actions": ["update"], "authority": {"read": True, "create": False, "write": True}, "schema_hash": "a" * 64, "revision": "b" * 64, "fields": []}
         with self.assertRaisesRegex(WorkflowProposalError, "unavailable"):
             _materialize_attended_crud_bundle(proposal, graph, catalog, ["frappe.browser.navigate", "frappe.browser.fill", "frappe.browser.click"])
+
+    def test_attended_update_revision_recheck_denies_concurrent_change(self):
+        preview = {
+            "proposal": "MST-WFP-UPDATE", "operation": "update", "doctype": "Customer",
+            "record_name": "ACME", "record_revision": "2026-07-20 10:11:12.123456",
+        }
+        with patch("muster.orchestration.workflow_proposal.attended_proposal_preview", return_value=preview):
+            current = assert_attended_update_revision(
+                "MST-WFP-UPDATE", "sales@example.test", "ACME", "2026-07-20 10:11:12.123456"
+            )
+            self.assertTrue(current["current"])
+            self.assertFalse(current["executed"])
+            with self.assertRaisesRegex(WorkflowProposalError, "changed after review"):
+                assert_attended_update_revision(
+                    "MST-WFP-UPDATE", "sales@example.test", "ACME", "2026-07-20 09:00:00.000000"
+                )
+
+    def test_attended_save_preflight_is_authorized_read_only_and_bound_to_client_receipt(self):
+        update = {
+            "proposal": "MST-WFP-UPDATE", "operation": "update", "doctype": "Customer",
+            "record_name": "ACME", "record_revision": "2026-07-20 10:11:12.123456",
+            "save_authorized": True, "fields": [{"fieldname": "customer_name", "label": "Customer Name", "control": "fill", "value": "Acme Ltd"}],
+        }
+        with patch("muster.orchestration.workflow_proposal.attended_proposal_preview", return_value=update):
+            result = preflight_attended_proposal_save(
+                "MST-WFP-UPDATE", "maker@example.test", "ACME", update["record_revision"],
+            )
+            self.assertTrue(result["current"])
+            self.assertFalse(result["executed"])
+            self.assertEqual(result["fields"], update["fields"])
+            with self.assertRaisesRegex(WorkflowProposalError, "changed after review"):
+                preflight_attended_proposal_save(
+                    "MST-WFP-UPDATE", "maker@example.test", "ACME", "stale",
+                )
+        create = {**update, "operation": "create", "record_name": None, "record_revision": None}
+        with patch("muster.orchestration.workflow_proposal.attended_proposal_preview", return_value=create):
+            self.assertTrue(preflight_attended_proposal_save("MST-WFP-CREATE", "maker@example.test")["current"])
+            with self.assertRaisesRegex(WorkflowProposalError, "cannot reuse"):
+                preflight_attended_proposal_save("MST-WFP-CREATE", "maker@example.test", "ACME", "revision")
+        with patch("muster.orchestration.workflow_proposal.attended_proposal_preview", return_value={**update, "save_authorized": False}):
+            with self.assertRaisesRegex(WorkflowProposalError, "Approve this proposal"):
+                preflight_attended_proposal_save(
+                    "MST-WFP-UPDATE", "maker@example.test", "ACME", update["record_revision"],
+                )
+
+    def test_delete_compiles_to_host_review_and_requires_independent_live_proof(self):
+        effect = {
+            "schemaVersion": 1, "capability": "frappe.record.delete",
+            "operation": {"kind": "record", "action": "delete", "doctype": "Customer", "docname": "ACME"},
+            "postconditions": [{"path": "$.deleted", "operator": "equals", "expected": True}],
+            "approvalClass": "dual_control",
+        }
+        proposal = descriptor()
+        proposal["steps"] = [{"kind": "execution", "label": "Delete customer", "capabilities": ["frappe.record.delete"], "execution": {"surface": "server_effect", "plan": effect}}]
+        graph = compiled_graph()
+        graph["entryNodeId"] = "n1-delete"
+        graph["nodes"] = [{"id": "n1-delete", "kind": "command", "requestedCapabilities": ["frappe.record.delete"], "retryLimit": 0, "executionIntent": {"surface": "server_effect", "plan": effect}}]
+        graph["edges"] = []
+        catalog = {
+            "doctype": "Customer", "record_name": "ACME", "record_identity_state": "unique",
+            "actions": ["read", "delete"], "authority": {"read": True, "create": False, "write": False, "delete": True},
+            "schema_hash": "a" * 64, "revision": "b" * 64, "fields": [],
+        }
+        authority = ["frappe.record.delete", "frappe.browser.navigate", "frappe.browser.click", "frappe.browser.read_visible"]
+        admitted, compiled = _materialize_attended_crud_bundle(
+            proposal, graph, catalog, authority, objective="Delete Customer ACME",
+        )
+        admitted = validate_workflow_descriptor(admitted, authority)
+        compiled = validate_compiled_graph(compiled, admitted, authority)
+        plan = compiled["nodes"][0]["executionIntent"]["plan"]
+        self.assertEqual(plan["attendedCrud"]["operation"], "delete")
+        self.assertEqual(plan["attendedCrud"]["fields"], [])
+        self.assertEqual([action["kind"] for action in plan["actions"]], ["navigate", "click", "read_visible"])
+        self.assertEqual(plan["actions"][1]["target"]["name"], "Menu")
+        self.assertEqual(plan["actions"][2]["target"]["name"], "Delete")
+
+        canonical_graph = json.dumps(compiled, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        proposal_doc = frappe._dict(
+            name="MST-WFP-DELETE", objective="Delete Customer ACME", status="Approved",
+            requested_by="maker@example.test", reviewed_by="checker@example.test", reviewed_at="2026-07-20 12:00:00",
+            descriptor_hash="c" * 64, compiled_graph_hash=sha256(canonical_graph.encode()).hexdigest(),
+            compiled_graph_json=json.dumps(compiled),
+        )
+        proposal_doc.destructive_record_revision = "2026-07-20 10:11:12.123456"
+        proposal_doc.destructive_approval_proof = _destructive_proof_value(
+            proposal_doc, plan["attendedCrud"], proposal_doc.destructive_record_revision,
+        )
+        with (
+            patch("muster.orchestration.workflow_proposal.assert_form_schema_binding", return_value={"fields": []}),
+            patch("muster.orchestration.workflow_proposal.frappe.db.get_value", return_value="2026-07-20 10:11:12.123456"),
+            patch("muster.orchestration.workflow_proposal.frappe.get_roles", return_value=["Muster Approver"]),
+        ):
+            preview = _attended_preview_projection(plan, "maker@example.test", proposal_doc)
+        self.assertTrue(preview["delete_authorized"])
+        self.assertTrue(preview["delete_requires_confirmation"])
+        self.assertEqual(len(preview["approval_proof"]), 64)
+        self.assertFalse(preview["executed"])
+        self.assertNotIn("actions", preview)
+
+        with patch("muster.orchestration.workflow_proposal.attended_proposal_preview", return_value=preview):
+            current = assert_attended_delete_revision(
+                proposal_doc.name, "maker@example.test", "ACME", preview["record_revision"], preview["approval_proof"],
+            )
+            self.assertTrue(current["current"])
+            self.assertFalse(current["executed"])
+            with self.assertRaisesRegex(WorkflowProposalError, "approval evidence"):
+                assert_attended_delete_revision(
+                    proposal_doc.name, "maker@example.test", "ACME", preview["record_revision"], "d" * 64,
+                )
+
+    def test_delete_maker_cannot_self_approve_and_manager_is_not_destructive_checker(self):
+        graph = {"nodes": [{"executionIntent": {"surface": "browser", "plan": {
+            "schemaVersion": 1, "actionBudget": 1,
+            "actions": [{"kind": "navigate", "route": "/desk/customer/ACME", "doctype": "Customer", "recordName": "ACME"}],
+            "attendedCrud": {"operation": "delete", "doctype": "Customer", "record_name": "ACME", "fields": [], "schema_hash": "a" * 64, "revision": "b" * 64},
+        }}}]}
+        canonical = json.dumps(graph, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        proposal = frappe._dict(requested_by="maker@example.test", compiled_graph_json=json.dumps(graph), compiled_graph_hash=sha256(canonical.encode()).hexdigest())
+        with self.assertRaises(frappe.PermissionError):
+            assert_destructive_reviewer(proposal, "maker@example.test")
+        with patch("muster.orchestration.workflow_proposal.frappe.get_roles", return_value=["Muster Automation Manager"]):
+            with self.assertRaises(frappe.PermissionError):
+                assert_destructive_reviewer(proposal, "manager@example.test")
+        with patch("muster.orchestration.workflow_proposal.frappe.get_roles", return_value=["Muster Approver"]):
+            assert_destructive_reviewer(proposal, "checker@example.test")
+
+    def test_exact_record_update_requires_a_different_authorized_checker(self):
+        graph = {"nodes": [{"executionIntent": {"surface": "browser", "plan": {
+            "schemaVersion": 1, "actionBudget": 1,
+            "actions": [{"kind": "navigate", "route": "/desk/customer/ACME", "doctype": "Customer", "recordName": "ACME"}],
+            "attendedCrud": {"operation": "update", "doctype": "Customer", "record_name": "ACME", "fields": [], "schema_hash": "a" * 64, "revision": "b" * 64},
+        }}}]}
+        canonical = json.dumps(graph, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        proposal = frappe._dict(
+            requested_by="maker@example.test", compiled_graph_json=json.dumps(graph),
+            compiled_graph_hash=sha256(canonical.encode()).hexdigest(),
+        )
+        with patch("muster.orchestration.workflow_proposal.frappe.get_roles", return_value=["Muster Approver"]):
+            with self.assertRaises(frappe.PermissionError):
+                assert_attended_reviewer(proposal, "maker@example.test")
+            assert_attended_reviewer(proposal, "checker@example.test")
+        with patch("muster.orchestration.workflow_proposal.frappe.get_roles", return_value=["Muster Viewer"]):
+            with self.assertRaises(frappe.PermissionError):
+                assert_attended_reviewer(proposal, "viewer@example.test")
+
+    def test_attended_create_clarifies_missing_or_invented_required_values_and_accepts_live_default(self):
+        def bundle(values):
+            effect = {
+                "schemaVersion": 1, "capability": "frappe.record.create",
+                "operation": {"kind": "record", "action": "create", "doctype": "Customer", "values": values},
+                "postconditions": [], "approvalClass": "single",
+            }
+            proposal = descriptor()
+            proposal["steps"] = [{"kind": "execution", "label": "Create", "capabilities": ["frappe.record.create"], "execution": {"surface": "server_effect", "plan": effect}}]
+            graph = compiled_graph(); graph["entryNodeId"] = "n1"; graph["nodes"] = [{"id": "n1", "kind": "command", "requestedCapabilities": ["frappe.record.create"], "retryLimit": 0, "executionIntent": {"surface": "server_effect", "plan": effect}}]; graph["edges"] = []
+            return proposal, graph
+
+        catalog = {
+            "doctype": "Customer", "record_name": None, "record_identity_state": "missing",
+            "actions": ["create"], "authority": {"read": True, "create": True, "write": True},
+            "schema_hash": "a" * 64, "revision": "b" * 64,
+            "fields": [
+                {"fieldname": "customer_name", "label": "Customer Name", "fieldtype": "Data", "required": True, "has_default": False, "writable": True},
+                {"fieldname": "customer_type", "label": "Customer Type", "fieldtype": "Select", "options": "Company\nIndividual", "required": True, "has_default": True, "writable": True},
+                {"fieldname": "custom_service_tier", "label": "Service Tier", "fieldtype": "Select", "options": "Silver\nGold", "required": False, "has_default": False, "writable": True},
+            ],
+        }
+        authority = ["frappe.browser.navigate", "frappe.browser.click", "frappe.browser.fill", "frappe.browser.select"]
+        proposal, graph = bundle({"custom_service_tier": "Gold"})
+        with self.assertRaisesRegex(WorkflowProposalClarification, r"What value should I use for Customer Name\?"):
+            _materialize_attended_crud_bundle(proposal, graph, catalog, authority, objective="Create a Gold customer")
+
+        proposal, graph = bundle({"customer_name": "Invented Corp"})
+        with self.assertRaisesRegex(WorkflowProposalClarification, r"What value should I use for Customer Name\?"):
+            _materialize_attended_crud_bundle(proposal, graph, catalog, authority, objective="Create a Customer")
+
+        proposal, graph = bundle({"customer_name": "ACME"})
+        admitted, compiled = _materialize_attended_crud_bundle(
+            proposal, graph, catalog, authority, objective="Create a Customer called ACME",
+        )
+        self.assertEqual(compiled["nodes"][0]["executionIntent"]["plan"]["attendedCrud"]["fields"], ["customer_name"])
+        self.assertNotIn("customer_type", json.dumps(compiled["nodes"][0]["executionIntent"]["plan"]["actions"]))
+
+        proposal, graph = bundle({"customer_name": "ACME", "custom_service_tier": "Platinum"})
+        with self.assertRaisesRegex(WorkflowProposalClarification, r"Choose an available value for Service Tier: Silver, Gold"):
+            _materialize_attended_crud_bundle(
+                proposal, graph, catalog, authority,
+                objective="Create a Customer called ACME with Service Tier Platinum",
+            )
+
+    def test_attended_create_resolves_redundant_record_noun_to_configured_link_default(self):
+        effect = {
+            "schemaVersion": 1, "capability": "frappe.record.create",
+            "operation": {
+                "kind": "record", "action": "create", "doctype": "CRM Lead",
+                "values": {"first_name": "Native CRM Browser Proof Three 2026-07-19", "status": "Lead"},
+            },
+            "postconditions": [], "approvalClass": "single",
+        }
+        proposal = descriptor()
+        proposal["steps"] = [{
+            "kind": "execution", "label": "Create", "capabilities": ["frappe.record.create"],
+            "execution": {"surface": "server_effect", "plan": effect},
+        }]
+        graph = compiled_graph()
+        graph["entryNodeId"] = "n1"
+        graph["nodes"] = [{
+            "id": "n1", "kind": "command", "requestedCapabilities": ["frappe.record.create"],
+            "retryLimit": 0, "executionIntent": {"surface": "server_effect", "plan": effect},
+        }]
+        graph["edges"] = []
+        catalog = {
+            "doctype": "CRM Lead", "record_name": None, "record_identity_state": "missing",
+            "actions": ["create"], "authority": {"read": True, "create": True, "write": True},
+            "schema_hash": "a" * 64, "revision": "b" * 64,
+            "fields": [
+                {"fieldname": "first_name", "label": "First Name", "fieldtype": "Data", "required": True, "has_default": False, "writable": True},
+                {"fieldname": "status", "label": "Status", "fieldtype": "Link", "options": "CRM Lead Status", "required": False, "has_default": False, "writable": True},
+            ],
+        }
+        parent_meta = Mock()
+        parent_meta.get_field.return_value = frappe._dict(default=None)
+        linked_meta = Mock()
+        linked_meta.has_field.return_value = True
+
+        def exists(doctype, name):
+            if doctype == "CRM Lead Status" and name == "Lead":
+                return False
+            return True
+
+        with (
+            patch("muster.orchestration.workflow_proposal.frappe.db.exists", side_effect=exists),
+            patch("muster.orchestration.workflow_proposal.frappe.get_meta", side_effect=[parent_meta, linked_meta, parent_meta, linked_meta]),
+            patch("muster.orchestration.workflow_proposal.frappe.get_list", return_value=[frappe._dict(name="New")]) as listed,
+        ):
+            _admitted, compiled = _materialize_attended_crud_bundle(
+                proposal, graph, catalog,
+                ["frappe.browser.navigate", "frappe.browser.click", "frappe.browser.fill", "frappe.browser.select"],
+                objective=(
+                    "Create a CRM Lead with First Name Native CRM Browser Proof Three 2026-07-19 "
+                    "and Status Lead"
+                ),
+            )
+        plan = compiled["nodes"][0]["executionIntent"]["plan"]
+        status_action = next(action for action in plan["actions"] if action.get("field") == "status")
+        self.assertEqual(status_action["value"], "New")
+        self.assertEqual(plan["attendedCrud"]["fields"], ["first_name", "status"])
+        self.assertEqual(listed.call_args.kwargs["order_by"], "position asc, name asc")
+
+    def test_attended_create_accepts_text_editor_as_scalar_but_rejects_html(self):
+        def bundle(fieldtype):
+            effect = {
+                "schemaVersion": 1, "capability": "frappe.record.create",
+                "operation": {
+                    "kind": "record", "action": "create", "doctype": "HD Ticket",
+                    "values": {"subject": "Checkout failure", "description": "Customer cannot complete checkout."},
+                },
+                "postconditions": [], "approvalClass": "single",
+            }
+            proposal = descriptor()
+            proposal["steps"] = [{
+                "kind": "execution", "label": "Create", "capabilities": ["frappe.record.create"],
+                "execution": {"surface": "server_effect", "plan": effect},
+            }]
+            graph = compiled_graph()
+            graph["entryNodeId"] = "n1"
+            graph["nodes"] = [{
+                "id": "n1", "kind": "command", "requestedCapabilities": ["frappe.record.create"],
+                "retryLimit": 0, "executionIntent": {"surface": "server_effect", "plan": effect},
+            }]
+            graph["edges"] = []
+            catalog = {
+                "doctype": "HD Ticket", "record_name": None, "record_identity_state": "missing",
+                "actions": ["create"], "authority": {"read": True, "create": True, "write": True},
+                "schema_hash": "a" * 64, "revision": "b" * 64,
+                "fields": [
+                    {"fieldname": "subject", "label": "Subject", "fieldtype": "Data", "required": True, "has_default": False, "writable": True},
+                    {"fieldname": "description", "label": "Description", "fieldtype": fieldtype, "required": True, "has_default": False, "writable": True},
+                ],
+            }
+            return proposal, graph, catalog
+
+        proposal, graph, catalog = bundle("Text Editor")
+        _admitted, compiled = _materialize_attended_crud_bundle(
+            proposal, graph, catalog,
+            ["frappe.browser.navigate", "frappe.browser.click", "frappe.browser.fill"],
+            requested_kind="attended_browser",
+            objective="Create an HD Ticket with Subject Checkout failure and Description Customer cannot complete checkout.",
+        )
+        plan = compiled["nodes"][0]["executionIntent"]["plan"]
+        self.assertEqual(plan["attendedCrud"]["fields"], ["description", "subject"])
+        self.assertEqual([action["kind"] for action in plan["actions"]], ["navigate", "click", "fill", "fill", "click"])
+
+        proposal, graph, catalog = bundle("HTML")
+        with self.assertRaisesRegex(WorkflowProposalError, "field type is not safely supported"):
+            _materialize_attended_crud_bundle(
+                proposal, graph, catalog,
+                ["frappe.browser.navigate", "frappe.browser.click", "frappe.browser.fill"],
+                requested_kind="attended_browser",
+                objective="Create an HD Ticket with Subject Checkout failure and Description Customer cannot complete checkout.",
+            )
+
+    def test_attended_update_requires_one_exact_record_identity(self):
+        effect = {
+            "schemaVersion": 1, "capability": "frappe.record.update",
+            "operation": {"kind": "record", "action": "update", "doctype": "Customer", "docname": "MODEL-GUESS", "values": {"customer_name": "ACME"}},
+            "postconditions": [], "approvalClass": "single",
+        }
+        proposal = descriptor(); proposal["steps"] = [{"kind": "execution", "label": "Update", "capabilities": ["frappe.record.update"], "execution": {"surface": "server_effect", "plan": effect}}]
+        graph = compiled_graph(); graph["entryNodeId"] = "n1"; graph["nodes"] = [{"id": "n1", "kind": "command", "requestedCapabilities": ["frappe.record.update"], "retryLimit": 0, "executionIntent": {"surface": "server_effect", "plan": effect}}]; graph["edges"] = []
+        catalog = {
+            "doctype": "Customer", "record_name": None, "record_identity_state": "ambiguous",
+            "actions": ["read"], "authority": {"read": True, "create": False, "write": True},
+            "schema_hash": "a" * 64, "revision": "b" * 64,
+            "fields": [{"fieldname": "customer_name", "label": "Customer Name", "fieldtype": "Data", "required": True, "has_default": False, "writable": True}],
+        }
+        with self.assertRaisesRegex(WorkflowProposalClarification, r"Which exact Customer record should I update\?"):
+            _materialize_attended_crud_bundle(
+                proposal, graph, catalog,
+                ["frappe.browser.navigate", "frappe.browser.fill", "frappe.browser.click"],
+                objective="Update Customer ACME",
+            )
 
     def test_attended_read_discards_model_routes_and_uses_the_host_record_scope(self):
         untrusted = {"surface": "browser", "plan": {"schemaVersion": 1, "actionBudget": 1, "actions": [{"kind": "navigate", "route": "/desk/Evil"}]}}

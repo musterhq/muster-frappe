@@ -24,6 +24,21 @@ from muster.automation.models import (
 APPROVER_ROLES = frozenset({"Muster Approver", "Muster Administrator", "System Manager"})
 
 
+def _expected_matches(actual: Any, expected: Any) -> bool:
+    """Match reviewed business values while ignoring Frappe child-row bookkeeping."""
+    if isinstance(expected, Mapping):
+        return isinstance(actual, Mapping) and all(
+            key in actual and _expected_matches(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, (list, tuple)):
+        return isinstance(actual, (list, tuple)) and len(actual) == len(expected) and all(
+            _expected_matches(actual_row, expected_row)
+            for actual_row, expected_row in zip(actual, expected)
+        )
+    return actual == expected
+
+
 class NativeBackend(TrustedResolver, Protocol):
     @property
     def site(self) -> str: ...
@@ -87,6 +102,9 @@ def preview(change_set: ArtifactChangeSet | Mapping[str, Any], backend: NativeBa
         raise AutomationValidationError("manifest site does not match the active Frappe site")
     if not backend.actor_enabled(change_set.actor):
         raise AutomationPermissionError("execution actor is missing or disabled")
+    source_validator = getattr(backend, "validate_change_set_source", None)
+    if source_validator:
+        source_validator(change_set)
 
     changes: list[NativeChange] = []
     overall = "None"
@@ -167,9 +185,14 @@ def _receipt(plan: Plan, change: NativeChange, inverse: Mapping[str, Any] | None
              *, replayed: bool = False) -> dict[str, Any]:
     effect = {"doctype": change.target_doctype, "name": change.target_name,
               "action": change.action, "after_hash": digest(change.after)}
+    manifest = next(item for item in plan.source.artifacts if item.artifact_id == change.artifact_id)
+    provenance = ({
+        "source_evidence_hash": plan.source.source_evidence.evidence_hash,
+        "source_citations": [item.as_dict() for item in manifest.source_citations],
+    } if plan.source.source_evidence else {})
     return {**effect, "artifact_id": change.artifact_id, "idempotency_key": change.idempotency_key,
             "plan_hash": plan.plan_hash, "effect_hash": digest(effect), "inverse": inverse,
-            "replayed": replayed}
+            "replayed": replayed, **provenance}
 
 
 def _compensate(backend: NativeBackend, inverse: Mapping[str, Any]) -> dict[str, Any]:
@@ -235,11 +258,14 @@ def apply(plan: Plan, backend: NativeBackend, governance: GovernanceContext,
                 inverse = None
                 if change.action == "create":
                     actual_name = backend.insert(change.target_doctype, change.target_name, change.after)
+                    # Register compensation before validating the framework's
+                    # returned name. Otherwise a DocType autoname override can
+                    # persist an orphan while the Change Set reports Repaired.
+                    inverse = {"kind": "delete", "doctype": change.target_doctype,
+                               "name": actual_name, "after_hash": digest(change.after)}
+                    inverses.append(inverse)
                     if actual_name != change.target_name:
                         raise AutomationConflictError("Frappe generated an unexpected artifact name")
-                    inverse = {"kind": "delete", "doctype": change.target_doctype,
-                               "name": change.target_name, "after_hash": digest(change.after)}
-                    inverses.append(inverse)
                 elif change.action == "update":
                     backend.update(change.target_doctype, change.target_name, change.after)
                     inverse = {"kind": "restore", "doctype": change.target_doctype,
@@ -252,7 +278,7 @@ def apply(plan: Plan, backend: NativeBackend, governance: GovernanceContext,
                 receipt = _receipt(plan, change, inverse)
                 fields = tuple(sorted(set(change.after) - {"doctype", "modified"}))
                 observed, _revision = backend.snapshot(change.target_doctype, change.target_name, fields)
-                if observed is None or any(observed.get(k) != v for k, v in change.after.items()):
+                if observed is None or not _expected_matches(observed, change.after):
                     raise AutomationConflictError(f"postcondition failed for {change.artifact_id}")
                 receipt["execution_id"] = execution_id
                 backend.record_receipt(execution_id, change, receipt)
@@ -290,16 +316,29 @@ def rollback(plan: Plan, execution: ExecutionEvidence, backend: NativeBackend,
     repairs = []
     with (backend.lock(f"muster-native-rollback:{execution.execution_id}") or nullcontext()):
         for inverse in reversed(execution.inverses):
+            matched = next((change for change in plan.changes
+                            if change.target_doctype == inverse["doctype"] and
+                            change.target_name == inverse["name"]), None)
             fields = tuple((inverse.get("values") or {}).keys())
             if not fields:
-                matched = next((change for change in plan.changes
-                                if change.target_doctype == inverse["doctype"] and
-                                change.target_name == inverse["name"]), None)
                 fields = tuple(matched.after) if matched else ()
             current, _ = backend.snapshot(inverse["doctype"], inverse["name"], tuple(fields))
             expected = inverse.get("after_hash")
-            if current is not None and expected and digest(current) != expected:
-                raise AutomationConflictError("artifact changed after apply; rollback would clobber user work")
+            if current is not None and expected:
+                # Frappe expands child rows with framework-owned bookkeeping
+                # (name, parent, idx, doctype, ...).  Apply verification already
+                # compares the reviewed business projection, so rollback must use
+                # the same fail-closed projection instead of hashing those
+                # generated fields.  Any reviewed business-field drift still
+                # blocks compensation.
+                unchanged = (
+                    _expected_matches(current, matched.after)
+                    if matched else digest(current) == expected
+                )
+                if not unchanged:
+                    raise AutomationConflictError(
+                        "artifact changed after apply; rollback would clobber user work"
+                    )
             repair = _compensate(backend, inverse)
             repairs.append(repair)
             if repair["status"] == "Failed":

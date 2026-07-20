@@ -44,12 +44,22 @@ _ATTENDED_FORM_ROUTE = "@attended-form"
 _EFFECT_CAPABILITIES = {
     "frappe.record.create": ("record", "create"),
     "frappe.record.update": ("record", "update"),
+    "frappe.record.delete": ("record", "delete"),
     "frappe.metadata.custom_field.create": ("native_artifact", "custom_field"),
     "frappe.metadata.property_setter.create": ("native_artifact", "property_setter"),
+    "frappe.metadata.doctype.create": ("native_artifact", "doctype"),
     "frappe.metadata.page.create": ("native_artifact", "page"),
+    "frappe.metadata.workspace.create": ("native_artifact", "workspace"),
     "frappe.metadata.report.create": ("native_artifact", "report"),
+    "frappe.metadata.script_report.create": ("native_artifact", "script_report"),
     "frappe.metadata.print_format.create": ("native_artifact", "print_format"),
     "frappe.metadata.web_page.create": ("native_artifact", "web_page"),
+    "frappe.metadata.web_form.create": ("native_artifact", "web_form"),
+    "frappe.metadata.client_script.create": ("native_artifact", "client_script"),
+    "frappe.metadata.server_script.create": ("native_artifact", "server_script"),
+    "frappe.metadata.email_template.create": ("native_artifact", "email_template"),
+    "frappe.automation.notification.create": ("native_artifact", "notification"),
+    "frappe.automation.assignment_rule.create": ("native_artifact", "assignment_rule"),
 }
 
 
@@ -312,7 +322,7 @@ def browser_action_plan(value: Any, path: str = "browser_action_plan") -> dict[s
         record_name = binding.get("record_name")
         fields = binding.get("fields")
         has_record = isinstance(record_name, str) and bool(record_name)
-        if operation not in {"create", "read", "update"} or (operation == "update" and not has_record) or (operation == "create" and record_name is not None) or (operation == "read" and record_name is not None and not has_record):
+        if operation not in {"create", "read", "update", "delete"} or (operation in {"update", "delete"} and not has_record) or (operation == "create" and record_name is not None) or (operation == "read" and record_name is not None and not has_record):
             raise WorkflowGraphError("invalid_browser_plan", "Attended CRUD lifecycle is invalid or unsupported", path)
         if not isinstance(fields, list) or len(fields) > 100 or len(set(fields)) != len(fields):
             raise WorkflowGraphError("invalid_browser_plan", "Attended CRUD fields are invalid", path)
@@ -361,26 +371,39 @@ def effect_intent(value: Any, path: str = "effect_intent") -> dict[str, Any]:
         raise WorkflowGraphError("invalid_effect_intent", "Effect approval or operation is invalid", path)
     family, action = _EFFECT_CAPABILITIES[capability]
     if family == "record":
-        allowed = {"kind", "action", "doctype", "values"} | ({"docname"} if "docname" in operation else set())
+        allowed = {"kind", "action", "doctype"}
+        if action != "delete":
+            allowed.add("values")
+        if "docname" in operation:
+            allowed.add("docname")
         _effect_exact_keys(operation, allowed, f"{path}.operation")
         if operation.get("kind") != "record" or operation.get("action") != action:
             raise WorkflowGraphError("invalid_effect_intent", "Record capability and action do not match", path)
         doctype = _effect_text(operation.get("doctype"), f"{path}.operation.doctype", 140)
         docname = operation.get("docname")
-        if action == "update":
+        if action in {"update", "delete"}:
             docname = _effect_text(docname, f"{path}.operation.docname", 500)
         elif docname is not None:
             raise WorkflowGraphError("invalid_effect_intent", "Record create cannot preselect a document name", path)
-        values = _bounded_json_object(operation.get("values"), f"{path}.operation.values")
+        values = {} if action == "delete" else _bounded_json_object(operation.get("values"), f"{path}.operation.values")
+        if action == "delete" and value.get("approvalClass") != "dual_control":
+            raise WorkflowGraphError("invalid_effect_intent", "Record deletion requires dual control", path)
         normalized_operation = {"kind": "record", "action": action, "doctype": doctype,
-                                **({"docname": docname} if docname else {}), "values": values}
+                                **({"docname": docname} if docname else {}),
+                                **({"values": values} if action != "delete" else {})}
     else:
         _effect_exact_keys(operation, {"kind", "artifactType", "intent"}, f"{path}.operation")
         if operation.get("kind") != "native_artifact" or operation.get("artifactType") != action:
             raise WorkflowGraphError("invalid_effect_intent", "Native capability and artifact do not match", path)
         native_intent = _bounded_json_object(operation.get("intent"), f"{path}.operation.intent")
-        if set(native_intent) - {"schema_version", "artifacts"} or not isinstance(native_intent.get("artifacts"), list) or not 1 <= len(native_intent["artifacts"]) <= 50:
+        if (set(native_intent) - {"schema_version", "artifacts", "source_file"}
+                or not isinstance(native_intent.get("artifacts"), list)
+                or not 1 <= len(native_intent["artifacts"]) <= 50):
             raise WorkflowGraphError("invalid_effect_intent", "Native intent must contain only bounded artifacts", path)
+        if "source_file" in native_intent:
+            native_intent["source_file"] = _effect_text(
+                native_intent["source_file"], f"{path}.operation.intent.source_file", 140
+            )
         expected_kind = {"report": "query_report"}.get(action, action)
         for artifact in native_intent["artifacts"]:
             if not isinstance(artifact, dict) or artifact.get("kind") != expected_kind:
@@ -389,7 +412,11 @@ def effect_intent(value: Any, path: str = "effect_intent") -> dict[str, Any]:
                 raise WorkflowGraphError("invalid_effect_intent", "Trusted executable templates require a separate privileged path", path)
         normalized_operation = {"kind": "native_artifact", "artifactType": action,
                                 "intent": native_intent}
-        if action in {"report", "print_format", "web_page"} and value.get("approvalClass") != "dual_control":
+        if action in {
+            "doctype", "page", "workspace", "report", "script_report", "print_format",
+            "web_page", "web_form", "notification", "assignment_rule",
+            "client_script", "server_script", "email_template",
+        } and value.get("approvalClass") != "dual_control":
             raise WorkflowGraphError(
                 "invalid_effect_intent", "Executable metadata requires dual control", path
             )
@@ -473,7 +500,7 @@ def canonical_execution_manifest(
             if operation["kind"] == "record":
                 doctypes = [operation["doctype"]]
                 record_names = [operation["docname"]] if operation.get("docname") else []
-                fields = sorted(operation["values"])
+                fields = sorted((operation.get("values") or {}).keys())
             else:
                 artifacts = operation["intent"].get("artifacts") or []
                 if not isinstance(artifacts, list) or any(not isinstance(item, dict) for item in artifacts):

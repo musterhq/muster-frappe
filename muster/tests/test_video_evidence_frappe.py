@@ -1,5 +1,7 @@
 import secrets
 import unittest
+import json
+from hashlib import sha256
 
 try:
     import frappe
@@ -27,7 +29,7 @@ class TestVideoEvidenceFrappe(FrappeTestCase):
 
     def test_seed_is_disabled_passwordless_and_permissions_are_exact(self):
         manifest = seed_video_evidence(confirm=True)
-        self.assertEqual(len(manifest["personas"]), 10)
+        self.assertEqual(len(manifest["personas"]), 11)
         self.assertFalse(manifest["credential_policy"]["stored_in_fixture"])
         self.assertFalse(manifest["credential_policy"]["accounts_enabled_by_seed"])
         for persona in manifest["personas"]:
@@ -51,6 +53,20 @@ class TestVideoEvidenceFrappe(FrappeTestCase):
         first = seed_video_evidence(confirm=True)
         second = seed_video_evidence(confirm=True)
         self.assertEqual(first, second)
+
+    def test_seed_repairs_disposable_crm_record_drift_from_prior_take(self):
+        manifest = seed_video_evidence(confirm=True)
+        lead = manifest["records"]["crm_lead_east"]["name"]
+        frappe.db.set_value(
+            "CRM Lead", lead,
+            {"first_name": "Edited", "last_name": "By Prior Recording"},
+        )
+        repaired = seed_video_evidence(confirm=True)
+        self.assertEqual(repaired["records"]["crm_lead_east"]["title"], "East Growth Contact")
+        self.assertEqual(
+            frappe.db.get_value("CRM Lead", lead, ["first_name", "last_name"]),
+            ("East", "Growth Contact"),
+        )
 
     def test_manifest_resolves_routes_and_visible_hidden_names(self):
         manifest = seed_video_evidence(confirm=True)
@@ -97,6 +113,8 @@ class TestVideoEvidenceFrappe(FrappeTestCase):
                     actual = bool(doc.has_permission("read", user=user))
                 elif action == "update":
                     actual = bool(doc.has_permission("write", user=user))
+                elif action == "delete":
+                    actual = bool(doc.has_permission("delete", user=user))
                 elif action == "submit":
                     actual = bool(doc.has_permission("submit", user=user))
                 elif action == "approve":
@@ -118,6 +136,49 @@ class TestVideoEvidenceFrappe(FrappeTestCase):
                     self.fail(f"unhandled action {action}")
             expected = case["expected"] == "allow"
             self.assertEqual(actual, expected, case["id"])
+
+    def test_attended_update_delete_has_live_maker_checker_and_denied_user(self):
+        from muster.orchestration.workflow_proposal import assert_destructive_reviewer
+
+        manifest = seed_video_evidence(confirm=True)
+        rotate_video_passwords(secrets.token_urlsafe(24), confirm=True)
+        users = {persona["key"]: persona["user"] for persona in manifest["personas"]}
+        records = manifest["records"]
+        maker = users["destructive_maker"]
+        checker = users["sales_approver"]
+        denied = users["auditor"]
+        target = frappe.get_doc("Customer", records["customer_delete_target"]["name"])
+        own_lead = frappe.get_doc("CRM Lead", records["crm_lead_east"]["name"])
+        other_lead = frappe.get_doc("CRM Lead", records["crm_lead_west"]["name"])
+
+        self.assertNotEqual(maker, checker)
+        self.assertTrue(target.has_permission("write", user=maker))
+        self.assertTrue(target.has_permission("delete", user=maker))
+        self.assertFalse(target.has_permission("write", user=denied))
+        self.assertFalse(target.has_permission("delete", user=denied))
+        self.assertTrue(own_lead.has_permission("write", user=users["crm_operator"]))
+        self.assertFalse(other_lead.has_permission("write", user=users["crm_operator"]))
+        self.assertFalse(own_lead.has_permission("write", user=denied))
+
+        graph = {"nodes": [{"executionIntent": {"surface": "browser", "plan": {
+            "schemaVersion": 1,
+            "actionBudget": 1,
+            "actions": [{"kind": "navigate", "route": f"/desk/customer/{target.name}", "doctype": "Customer", "recordName": target.name}],
+            "attendedCrud": {"operation": "delete", "doctype": "Customer", "record_name": target.name, "fields": [], "schema_hash": "a" * 64, "revision": "b" * 64},
+        }}}]}
+        compiled_graph_json = json.dumps(
+            graph, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        proposal = frappe._dict(
+            requested_by=maker,
+            compiled_graph_json=compiled_graph_json,
+            compiled_graph_hash=sha256(compiled_graph_json.encode()).hexdigest(),
+        )
+        with self.assertRaises(frappe.PermissionError):
+            assert_destructive_reviewer(proposal, maker)
+        assert_destructive_reviewer(proposal, checker)
+        with self.assertRaises(frappe.PermissionError):
+            assert_destructive_reviewer(proposal, denied)
 
     def test_runtime_rotation_and_immediate_revoke(self):
         manifest = seed_video_evidence(confirm=True)

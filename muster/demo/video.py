@@ -193,6 +193,19 @@ def _ensure_master_records(site: str, users: dict[str, str]) -> dict[str, Any]:
             },
         )
 
+    delete_customer_name = f"{VIDEO_PREFIX} Disposable Delete Review Target"
+    records["customer_delete_target"], _created = _ensure_doc(
+        "Customer",
+        {"customer_name": delete_customer_name},
+        {
+            "customer_name": delete_customer_name,
+            "customer_type": "Company",
+            "customer_group": customer_group,
+            "territory": territory,
+            "disabled": 0,
+        },
+    )
+
     parent_department = _first("Department", {"is_group": 1, "company": company})
     for region in ("east", "west"):
         department_name = f"{VIDEO_PREFIX} {region.title()} Operations"
@@ -327,7 +340,21 @@ def _ensure_master_records(site: str, users: dict[str, str]) -> dict[str, Any]:
                 "organization": organization_name,
             },
         )
-        frappe.db.set_value("CRM Lead", records[f"crm_lead_{region}"].name, "lead_owner", owner)
+        # A prior attended-browser recording may have deliberately edited this
+        # disposable record. Re-seeding must restore the exact scenario rather
+        # than preserve demo drift from an earlier take.
+        frappe.db.set_value(
+            "CRM Lead",
+            records[f"crm_lead_{region}"].name,
+            {
+                "first_name": region.title(),
+                "last_name": "Growth Contact",
+                "lead_name": f"{region.title()} Growth Contact",
+                "status": lead_status,
+                "organization": organization_name,
+                "lead_owner": owner,
+            },
+        )
         records[f"crm_lead_{region}"].reload()
         deal_marker = f"{VIDEO_PREFIX} {region.title()} discovery review"
         records[f"crm_deal_{region}"], _created = _ensure_doc(
@@ -407,6 +434,10 @@ def _replace_user_permissions(
                 }
             ).insert()
             resolved[persona["key"]].append({"allow": permission["allow"], "for_value": for_value})
+        # Seeding is deliberately idempotent and may follow a revoke in the same
+        # process. Evict role and user-permission caches only after the complete
+        # replacement, otherwise permission checks can observe the revoked state.
+        frappe.clear_cache(user=user)
     return resolved
 
 

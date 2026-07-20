@@ -5,7 +5,7 @@ from typing import Any
 
 import frappe
 from frappe import _
-from frappe.utils import get_datetime, now_datetime
+from frappe.utils import convert_utc_to_system_timezone, get_datetime, now_datetime
 
 from muster.adapters.client import GatewayClient, trusted_binding
 from muster.adapters.identity import allowed_channel_scopes, frappe_identity
@@ -50,6 +50,19 @@ def _owned_identity(name: str):
     if identity.user != frappe.session.user and not roles.intersection({"System Manager", "Muster Administrator"}):
         frappe.throw(_("Not permitted"), frappe.PermissionError)
     return identity
+
+
+def _database_datetime(value: str):
+    """Convert an RFC 3339 gateway timestamp to Frappe's naive system time.
+
+    MariaDB ``Datetime`` columns reject offset-bearing values. Frappe compares
+    stored datetimes with ``now_datetime()``, which is also naive system time,
+    so normalize once at the trust boundary instead of discarding the offset.
+    """
+    parsed = get_datetime(value)
+    if parsed.tzinfo is not None:
+        parsed = convert_utc_to_system_timezone(parsed).replace(tzinfo=None)
+    return parsed
 
 
 @frappe.whitelist()
@@ -102,7 +115,7 @@ def issue_telegram_link(channel_account: str) -> dict[str, Any]:
         "permission_epoch": epoch,
         "idempotency_fingerprint": fingerprint,
         "pending_start_url": start_url,
-        "expires_at": get_datetime(expires_at),
+        "expires_at": _database_datetime(expires_at),
     }).insert()
     return {
         "identity": identity.name,

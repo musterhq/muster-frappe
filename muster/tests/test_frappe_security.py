@@ -4,7 +4,7 @@ from uuid import uuid4
 try:
     import frappe
     from frappe.tests.utils import FrappeTestCase
-    from frappe.utils import now_datetime
+    from frappe.utils import add_to_date, now_datetime
 except ModuleNotFoundError as exc:  # Pure package checks run without a Bench environment.
     raise unittest.SkipTest("Frappe integration tests require an installed test site") from exc
 
@@ -17,6 +17,7 @@ class TestMusterSecurity(FrappeTestCase):
         self.operator = self._make_user(f"operator-{suffix}@example.test", "Muster Operator")
         self.viewer = self._make_user(f"viewer-{suffix}@example.test", "Muster Viewer")
         self.auditor = self._make_user(f"auditor-{suffix}@example.test", "Muster Auditor")
+        self.approver = self._make_user(f"approver-{suffix}@example.test", "Muster Approver")
 
     def tearDown(self):
         frappe.set_user(self.original_user)
@@ -112,6 +113,34 @@ class TestMusterSecurity(FrappeTestCase):
         frappe.set_user(self.operator)
         with self.assertRaises(frappe.ValidationError):
             approval.insert(ignore_permissions=True)
+
+    def test_destructive_approval_does_not_regress_verified_change_set(self):
+        frappe.set_user("Administrator")
+        change_set = frappe.get_doc({
+            "doctype": "Muster Change Set", "mission": self._make_mission(),
+            "status": "Verified", "risk_class": "Critical",
+            "approval_class": "Sensitive", "target_site": frappe.local.site,
+            "actor": self.operator, "permission_epoch": "test-epoch",
+            "plan_hash": "1" * 64,
+            "operations": [{
+                "operation_id": "verified-op-1",
+                "operation_type": "update_record",
+                "target_doctype": "ToDo",
+                "idempotency_key": uuid4().hex,
+            }],
+        }).insert(ignore_permissions=True)
+        approval = frappe.get_doc({
+            "doctype": "Muster Approval", "mission": change_set.mission,
+            "change_set": change_set.name, "status": "Pending",
+            "approval_class": "Destructive", "requested_by": self.operator,
+            "requested_from": self.approver, "action_hash": "1" * 64,
+            "expires_at": add_to_date(now_datetime(), minutes=10),
+        }).insert(ignore_permissions=True)
+        frappe.set_user(self.approver)
+        approval.status = "Approved"
+        approval.save(ignore_permissions=True)
+
+        self.assertEqual(frappe.db.get_value("Muster Change Set", change_set.name, "status"), "Verified")
 
     def _make_mission(self) -> str:
         return frappe.get_doc(

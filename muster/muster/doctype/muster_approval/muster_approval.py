@@ -26,6 +26,11 @@ class MusterApproval(Document):
 
     def on_update(self):
         previous = self.get_doc_before_save()
+        # A Destructive decision authorizes compensation for an already
+        # Verified effect. It must never regress or fail the forward Change Set;
+        # rollback_attended owns the subsequent Repaired transition.
+        if self.approval_class == "Destructive":
+            return
         if self.status == "Rejected" and (not previous or previous.status != "Rejected"):
             frappe.db.set_value("Muster Change Set", self.change_set, "status", "Failed", update_modified=True)
             if frappe.db.get_value("Muster Mission", self.mission, "status") == "Waiting for Approval":

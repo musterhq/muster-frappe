@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hmac
 import re
 from collections import Counter
 from hashlib import sha256
@@ -16,7 +17,11 @@ from muster.adapters.context import permission_filtered_context
 from muster.adapters.run_authority import run_authority_headers
 from muster.orchestration.gateway_runtime import _caller_capabilities
 from muster.orchestration.gateway_runtime import _capability_authority
-from muster.orchestration.form_schema import MusterFormSchemaError, effective_form_schema
+from muster.orchestration.form_schema import (
+    MusterFormSchemaError,
+    assert_form_schema_binding,
+    effective_form_schema,
+)
 from muster.orchestration.studio import publish_workflow
 from muster.orchestration.workflow_graph import (
     browser_action_plan,
@@ -44,10 +49,107 @@ SCHEMA_KEYS = {
     "additionalProperties", "items", "minItems", "maxItems", "minimum", "maximum",
     "minLength", "maxLength", "pattern", "format", "oneOf", "anyOf", "allOf",
 }
+DESTRUCTIVE_REVIEW_ROLES = {"System Manager", "Muster Administrator", "Muster Approver"}
 
 
 class WorkflowProposalError(frappe.ValidationError):
     pass
+
+
+class WorkflowProposalClarification(WorkflowProposalError):
+    """Safe, user-actionable missing information; never an execution failure."""
+
+    pass
+
+
+def proposal_attended_operation(proposal) -> str | None:
+    """Read one immutable attended operation without granting execution authority."""
+    try:
+        graph = json.loads(proposal.compiled_graph_json)
+    except (TypeError, ValueError) as error:
+        raise WorkflowProposalError(_("Stored workflow proposal evidence is invalid")) from error
+    canonical = json.dumps(graph, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    if sha256(canonical.encode()).hexdigest() != proposal.compiled_graph_hash:
+        raise WorkflowProposalError(_("Stored compiled graph hash does not match"))
+    operations = []
+    for node in graph.get("nodes", []):
+        execution = node.get("executionIntent") if isinstance(node, dict) else None
+        if not isinstance(execution, dict):
+            continue
+        if execution.get("surface") == "server_effect":
+            plan = effect_intent(execution.get("plan"), "workflow proposal review")
+            if plan.get("capability") == "frappe.record.delete":
+                operations.append("delete")
+            continue
+        if execution.get("surface") != "browser":
+            continue
+        plan = browser_action_plan(execution.get("plan"), "workflow proposal review")
+        binding = plan.get("attendedCrud")
+        if binding:
+            operations.append(binding["operation"])
+    if "delete" in operations and operations != ["delete"]:
+        raise WorkflowProposalError(_("Record deletion must be the proposal's only attended action"))
+    return operations[0] if len(operations) == 1 else None
+
+
+def assert_destructive_reviewer(proposal, reviewer: str) -> None:
+    """Require a live, independent checker for attended record deletion."""
+    if proposal_attended_operation(proposal) != "delete":
+        return
+    if not reviewer or reviewer == "Guest" or reviewer.lower() == str(proposal.requested_by).lower():
+        frappe.throw(_("Record deletion requires approval from a different user"), frappe.PermissionError)
+    if reviewer != "Administrator" and not DESTRUCTIVE_REVIEW_ROLES.intersection(frappe.get_roles(reviewer)):
+        frappe.throw(_("Record deletion requires a Muster Approver or administrator"), frappe.PermissionError)
+
+
+def assert_attended_reviewer(proposal, reviewer: str) -> None:
+    """Require separation of duties for exact-record update and delete proposals."""
+    operation = proposal_attended_operation(proposal)
+    if operation not in {"update", "delete"}:
+        return
+    if not reviewer or reviewer == "Guest" or reviewer.lower() == str(proposal.requested_by).lower():
+        frappe.throw(_("Exact-record changes require approval from a different user"), frappe.PermissionError)
+    if operation == "delete":
+        assert_destructive_reviewer(proposal, reviewer)
+        return
+    roles = set(frappe.get_roles(reviewer))
+    if reviewer != "Administrator" and not roles.intersection(
+        {"System Manager", "Muster Administrator", "Muster Automation Manager", "Muster Approver"}
+    ):
+        frappe.throw(_("Record updates require an authorized Muster reviewer"), frappe.PermissionError)
+
+
+def issue_destructive_approval_evidence(proposal, reviewer: str, reviewed_at) -> dict[str, str]:
+    """Bind checker approval to the exact live record revision and requester RBAC."""
+    assert_destructive_reviewer(proposal, reviewer)
+    _verified_proposal_snapshot(proposal, proposal.requested_by)
+    _verified_requested_scope(proposal)
+    graph = json.loads(proposal.compiled_graph_json)
+    plans = [
+        node["executionIntent"]["plan"] for node in graph.get("nodes", [])
+        if isinstance(node, dict) and isinstance(node.get("executionIntent"), dict)
+        and node["executionIntent"].get("surface") == "browser"
+    ]
+    if len(plans) != 1:
+        raise WorkflowProposalError(_("This proposal does not contain one attended Desk action"))
+    plan = browser_action_plan(plans[0], "destructive proposal approval")
+    binding = plan.get("attendedCrud")
+    if not isinstance(binding, dict) or binding.get("operation") != "delete":
+        raise WorkflowProposalError(_("This proposal is not an attended delete review"))
+    assert_form_schema_binding(binding, user=proposal.requested_by)
+    expected_plan = _host_attended_delete_plan({
+        "doctype": binding["doctype"], "record_name": binding["record_name"],
+        "schema_hash": binding["schema_hash"], "revision": binding["revision"],
+    })
+    if plan != expected_plan:
+        raise WorkflowProposalError(_("The delete review plan is not the host-authored safe sequence"))
+    record_revision = str(frappe.db.get_value(binding["doctype"], binding["record_name"], "modified") or "")
+    if not record_revision:
+        raise WorkflowProposalError(_("The reviewed record is no longer available"))
+    proof = _destructive_proof_value(
+        proposal, binding, record_revision, reviewer=reviewer, reviewed_at=reviewed_at,
+    )
+    return {"record_revision": record_revision, "approval_proof": proof}
 
 
 def request_workflow_proposal(
@@ -58,6 +160,7 @@ def request_workflow_proposal(
     client: GatewayClient | None = None,
     binding: GatewayBinding | None = None,
     preferred_handoff_kind: str | None = None,
+    verified_record_identity: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     objective = _bounded_text(objective, "objective", 10_000)
     if not isinstance(scope, dict):
@@ -78,7 +181,16 @@ def request_workflow_proposal(
     client = client or GatewayClient(binding)
     reviewed_scope = _canonical_requested_scope(scope)
     context = permission_filtered_context(reviewed_scope, user)
-    attended_catalogs = _attended_form_catalogs(reviewed_scope, user, objective)
+    attended_catalogs = _attended_form_catalogs(
+        reviewed_scope, user, objective, verified_record_identity=verified_record_identity,
+    )
+    if preferred_handoff_kind in {"governed_change", "attended_browser"}:
+        clarification = _attended_preflight_clarification(objective, attended_catalogs)
+        if clarification:
+            return {
+                "status": "clarification", "reason": clarification,
+                "replayed": False, "executed": False,
+            }
     if attended_catalogs:
         context = {**context, "attended_form_catalog": [{
             "doctype": catalog["doctype"], "actions": catalog["actions"],
@@ -100,15 +212,22 @@ def request_workflow_proposal(
         },
         idempotency_key=idempotency_key,
         headers=headers,
+        read_timeout=180,
     )
     if response.get("schemaVersion") != 1 or response.get("requestId") != request_id or response.get("status") != "proposed":
         raise WorkflowProposalError(_("The gateway returned an invalid planning acknowledgement"))
     raw_descriptor, raw_graph = response.get("proposal"), response.get("graph")
     if preferred_handoff_kind in {"governed_change", "attended_browser"}:
-        raw_descriptor, raw_graph = _materialize_attended_crud_bundle(
-            raw_descriptor, raw_graph, attended_catalogs, allowed_capabilities,
-            requested_kind=preferred_handoff_kind,
-        )
+        try:
+            raw_descriptor, raw_graph = _materialize_attended_crud_bundle(
+                raw_descriptor, raw_graph, attended_catalogs, allowed_capabilities,
+                requested_kind=preferred_handoff_kind, objective=objective,
+            )
+        except WorkflowProposalClarification as clarification:
+            return {
+                "status": "clarification", "reason": str(clarification),
+                "replayed": False, "executed": False,
+            }
     descriptor = validate_workflow_descriptor(raw_descriptor, allowed_capabilities)
     graph = validate_compiled_graph(raw_graph, descriptor, allowed_capabilities)
     run_metadata = validate_run_metadata(response.get("run"))
@@ -329,6 +448,293 @@ def start_published_proposal_mission(
     return {"mission": mission.name, "status": mission.status, "replayed": False}
 
 
+def attended_proposal_preview(proposal_name: str, actor: str) -> dict[str, Any]:
+    """Return a host-shaped, non-saving Desk preview for one attended proposal.
+
+    The portable graph remains the authoritative evidence.  This projection
+    deliberately omits routes, selectors, capabilities and hashes from the
+    browser-facing response; the Desk controller receives only the exact form
+    identity and scalar values it is allowed to stage before a separate Save
+    confirmation.
+    """
+    _bounded_text(proposal_name, "proposal", 140)
+    if actor == "Guest":
+        frappe.throw(_("Not permitted"), frappe.PermissionError)
+    proposal = frappe.get_doc("Muster Workflow Proposal", proposal_name)
+    if proposal.requested_by != actor or not proposal.has_permission("read", user=actor):
+        frappe.throw(_("Only the original requester can preview this work"), frappe.PermissionError)
+    if proposal.status not in {"Proposed", "Approved"}:
+        raise WorkflowProposalError(_("This proposal is no longer available for an attended preview"))
+
+    _verified_proposal_snapshot(proposal, actor)
+    _verified_requested_scope(proposal)
+    graph = json.loads(proposal.compiled_graph_json)
+    plans = [
+        node["executionIntent"]["plan"]
+        for node in graph.get("nodes", [])
+        if isinstance(node, dict)
+        and isinstance(node.get("executionIntent"), dict)
+        and node["executionIntent"].get("surface") == "browser"
+    ]
+    if len(plans) != 1:
+        raise WorkflowProposalError(_("This proposal does not contain one attended Desk action"))
+    plan = browser_action_plan(plans[0], "attended proposal preview")
+    return _attended_preview_projection(plan, actor, proposal)
+
+
+def verify_attended_proposal_record(
+    proposal_name: str, actor: str, record_name: str
+) -> dict[str, Any]:
+    """Reread the saved record and bind it to the reviewed attended values."""
+    preview = attended_proposal_preview(proposal_name, actor)
+    if preview["operation"] not in {"create", "update"}:
+        raise WorkflowProposalError(_("This attended work does not save a record"))
+    if not preview["save_authorized"]:
+        raise WorkflowProposalError(_("Approve this proposal before Muster verifies a Save"))
+    _bounded_text(record_name, "record name", 500)
+    if preview.get("record_name") and preview["record_name"] != record_name:
+        raise WorkflowProposalError(_("The saved record does not match the reviewed target"))
+    doc = frappe.get_doc(preview["doctype"], record_name)
+    if not doc.has_permission("read", user=actor):
+        frappe.throw(_("The saved record is not readable by this user"), frappe.PermissionError)
+    expected = {field["fieldname"]: field["value"] for field in preview["fields"]}
+    for fieldname, planned in expected.items():
+        actual = doc.get(fieldname)
+        if isinstance(actual, (dict, list, tuple)) or str(actual if actual is not None else "") != str(planned):
+            raise WorkflowProposalError(_("The saved record did not retain every reviewed field value"))
+    proof = sha256(json.dumps({
+        "proposal": proposal_name,
+        "doctype": preview["doctype"],
+        "record_name": record_name,
+        "expected": expected,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    return {
+        "proposal": proposal_name,
+        "doctype": preview["doctype"],
+        "record_name": record_name,
+        "verified": True,
+        "proof_hash": proof,
+    }
+
+
+def assert_attended_update_revision(
+    proposal_name: str, actor: str, record_name: str, expected_revision: str
+) -> dict[str, Any]:
+    """Recheck an attended update immediately before its visible Save."""
+    _bounded_text(record_name, "record name", 500)
+    _bounded_text(expected_revision, "record revision", 100)
+    preview = attended_proposal_preview(proposal_name, actor)
+    if preview["operation"] != "update" or preview.get("record_name") != record_name:
+        raise WorkflowProposalError(_("The update target no longer matches the reviewed proposal"))
+    if preview.get("record_revision") != expected_revision:
+        raise WorkflowProposalError(_("The record changed after review; reload it before preparing another update"))
+    return {
+        "proposal": proposal_name,
+        "doctype": preview["doctype"],
+        "record_name": record_name,
+        "record_revision": expected_revision,
+        "current": True,
+        "executed": False,
+    }
+
+
+def preflight_attended_proposal_save(
+    proposal_name: str,
+    actor: str,
+    record_name: str = "",
+    expected_revision: str = "",
+) -> dict[str, Any]:
+    """Rebuild schema, proposal and live RBAC immediately before native Save.
+
+    This boundary is read-only. The browser must visibly click the host
+    application's native Create/Save control and then seal the saved values via
+    ``verify_attended_proposal_record``.
+    """
+    preview = attended_proposal_preview(proposal_name, actor)
+    if preview["operation"] not in {"create", "update"}:
+        raise WorkflowProposalError(_("This attended work does not save a record"))
+    if not preview.get("save_authorized"):
+        raise WorkflowProposalError(_("Approve this proposal before saving the reviewed form"))
+    if preview["operation"] == "create":
+        if record_name or expected_revision:
+            raise WorkflowProposalError(_("A create confirmation cannot reuse an existing record binding"))
+    else:
+        _bounded_text(record_name, "record name", 500)
+        _bounded_text(expected_revision, "record revision", 100)
+        if preview.get("record_name") != record_name:
+            raise WorkflowProposalError(_("The update target no longer matches the reviewed proposal"))
+        if preview.get("record_revision") != expected_revision:
+            raise WorkflowProposalError(_("The record changed after review; reload it before preparing another update"))
+    return {
+        "proposal": proposal_name,
+        "operation": preview["operation"],
+        "doctype": preview["doctype"],
+        "record_name": preview.get("record_name"),
+        "record_revision": preview.get("record_revision"),
+        "fields": preview["fields"],
+        "current": True,
+        "executed": False,
+    }
+
+
+def assert_attended_delete_revision(
+    proposal_name: str, actor: str, record_name: str, expected_revision: str,
+    expected_approval_proof: str,
+) -> dict[str, Any]:
+    """Recheck record identity, delete RBAC and independent approval before menu reveal."""
+    _bounded_text(record_name, "record name", 500)
+    _bounded_text(expected_revision, "record revision", 100)
+    _bounded_text(expected_approval_proof, "approval proof", 64)
+    preview = attended_proposal_preview(proposal_name, actor)
+    if preview["operation"] != "delete" or preview.get("record_name") != record_name:
+        raise WorkflowProposalError(_("The delete target no longer matches the reviewed proposal"))
+    if not preview.get("delete_authorized") or preview.get("record_revision") != expected_revision:
+        raise WorkflowProposalError(_("The record or destructive approval changed; prepare another delete review"))
+    actual_proof = preview.get("approval_proof")
+    if not isinstance(actual_proof, str) or not hmac.compare_digest(actual_proof, expected_approval_proof):
+        raise WorkflowProposalError(_("The destructive approval evidence no longer matches"))
+    return {
+        "proposal": proposal_name, "doctype": preview["doctype"], "record_name": record_name,
+        "record_revision": expected_revision, "approval_proof": actual_proof,
+        "current": True, "executed": False,
+    }
+
+
+def trusted_attended_delete_snapshot(proposal_name: str, actor: str) -> dict[str, Any]:
+    """Return server-only evidence for a final attended delete authorization.
+
+    Unlike ``attended_proposal_preview`` this includes the hash of the exact
+    host-authored browser plan.  It must never be returned directly to Desk.
+    """
+    preview = attended_proposal_preview(proposal_name, actor)
+    if preview.get("operation") != "delete" or not preview.get("delete_authorized"):
+        raise WorkflowProposalError(_("This proposal has no approved attended deletion"))
+    proposal = frappe.get_doc("Muster Workflow Proposal", proposal_name)
+    graph = json.loads(proposal.compiled_graph_json)
+    plans = [
+        node["executionIntent"]["plan"]
+        for node in graph.get("nodes", [])
+        if isinstance(node, dict)
+        and isinstance(node.get("executionIntent"), dict)
+        and node["executionIntent"].get("surface") == "browser"
+    ]
+    if len(plans) != 1:
+        raise WorkflowProposalError(_("This proposal does not contain one attended Desk action"))
+    plan = browser_action_plan(plans[0], "attended delete authorization")
+    canonical = json.dumps(plan, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return {**preview, "plan_hash": sha256(canonical.encode()).hexdigest()}
+
+
+def _attended_preview_projection(plan: dict[str, Any], actor: str, proposal) -> dict[str, Any]:
+    binding = plan.get("attendedCrud")
+    if not isinstance(binding, dict) or binding.get("operation") not in {"create", "update", "delete"}:
+        raise WorkflowProposalError(_("This proposal is not an attended form change"))
+    snapshot = assert_form_schema_binding(binding, user=actor)
+    operation = binding["operation"]
+    if operation == "delete":
+        expected_plan = _host_attended_delete_plan({
+            "doctype": binding["doctype"], "record_name": binding["record_name"],
+            "schema_hash": binding["schema_hash"], "revision": binding["revision"],
+        })
+        if plan != expected_plan:
+            raise WorkflowProposalError(_("The delete review plan is not the host-authored safe sequence"))
+        record_revision = str(frappe.db.get_value(binding["doctype"], binding["record_name"], "modified") or "")
+        if not record_revision:
+            raise WorkflowProposalError(_("The reviewed record is no longer available"))
+        approval_proof = _destructive_approval_proof(proposal, binding, record_revision)
+        return {
+            "proposal": proposal.name, "objective": proposal.objective, "operation": "delete",
+            "doctype": binding["doctype"], "record_name": binding["record_name"],
+            "record_revision": record_revision, "approval_proof": approval_proof,
+            "fields": [], "delete_requires_confirmation": True,
+            "delete_authorized": approval_proof is not None, "executed": False,
+        }
+    save_indexes = [
+        index for index, action in enumerate(plan["actions"])
+        if action.get("kind") == "click"
+        and action.get("target", {}).get("kind") == "role"
+        and action.get("target", {}).get("role") == "button"
+        and action.get("target", {}).get("name", "").lower() == "save"
+    ]
+    if save_indexes != [len(plan["actions"]) - 1]:
+        raise WorkflowProposalError(_("The attended plan must pause at one final Save action"))
+    values: dict[str, dict[str, str]] = {}
+    for action in plan["actions"][:-1]:
+        if action.get("kind") not in {"fill", "select"}:
+            continue
+        fieldname = action.get("field")
+        if fieldname in values:
+            raise WorkflowProposalError(_("The attended plan changes a field more than once"))
+        values[fieldname] = {
+            "fieldname": fieldname,
+            "control": action["kind"],
+            "value": action["value"] if action["kind"] == "fill" else action["option"],
+        }
+    if sorted(values) != binding["fields"]:
+        raise WorkflowProposalError(_("The attended plan fields do not match its reviewed form binding"))
+    live_fields = {field["fieldname"]: field for field in snapshot["fields"]}
+    projected_fields = []
+    for fieldname in sorted(values):
+        field = live_fields.get(fieldname)
+        operation_writable = field and field.get(
+            "create_writable" if operation == "create" else "update_writable", field["writable"]
+        )
+        if not field or not operation_writable:
+            raise WorkflowProposalError(_("A reviewed field is no longer writable"))
+        projected_fields.append({
+            **values[fieldname],
+            "label": field["label"],
+        })
+    record_revision = None
+    if operation == "update":
+        record_revision = str(frappe.db.get_value(binding["doctype"], binding["record_name"], "modified") or "")
+        if not record_revision:
+            raise WorkflowProposalError(_("The reviewed record is no longer available"))
+    return {
+        "proposal": proposal.name,
+        "objective": proposal.objective,
+        "operation": operation,
+        "doctype": binding["doctype"],
+        "record_name": binding.get("record_name"),
+        "record_revision": record_revision,
+        "fields": projected_fields,
+        "save_requires_confirmation": True,
+        "save_authorized": proposal.status == "Approved",
+        "executed": False,
+    }
+
+
+def _destructive_approval_proof(proposal, binding: dict[str, Any], record_revision: str) -> str | None:
+    if proposal.status != "Approved":
+        return None
+    assert_destructive_reviewer(proposal, str(proposal.reviewed_by or ""))
+    stored_revision = str(proposal.destructive_record_revision or "")
+    stored_proof = str(proposal.destructive_approval_proof or "")
+    if not proposal.reviewed_at or not stored_revision or not stored_proof:
+        raise WorkflowProposalError(_("Destructive approval evidence is incomplete"))
+    if record_revision != stored_revision:
+        raise WorkflowProposalError(_("The record changed after destructive approval; prepare and approve another proposal"))
+    expected = _destructive_proof_value(proposal, binding, record_revision)
+    if len(stored_proof) != 64 or not hmac.compare_digest(expected, stored_proof):
+        raise WorkflowProposalError(_("Destructive approval evidence does not match the reviewed proposal"))
+    return stored_proof
+
+
+def _destructive_proof_value(
+    proposal, binding: dict[str, Any], record_revision: str, *,
+    reviewer: str | None = None, reviewed_at=None,
+) -> str:
+    evidence = {
+        "schema_version": 1, "proposal": proposal.name,
+        "requester": proposal.requested_by, "reviewer": reviewer or proposal.reviewed_by,
+        "reviewed_at": str(reviewed_at or proposal.reviewed_at),
+        "descriptor_hash": proposal.descriptor_hash, "compiled_graph_hash": proposal.compiled_graph_hash,
+        "doctype": binding["doctype"], "record_name": binding["record_name"],
+        "record_revision": record_revision,
+    }
+    return sha256(json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+
+
 def _verified_proposal_snapshot(proposal, actor: str) -> dict[str, Any]:
     try:
         descriptor = json.loads(proposal.descriptor_json)
@@ -366,15 +772,36 @@ def _verified_requested_scope(proposal) -> dict[str, Any]:
     return normalized
 
 
-def _attended_form_catalogs(scope: dict[str, Any], user: str, objective: str) -> list[dict[str, Any]]:
+def _attended_form_catalogs(
+    scope: dict[str, Any], user: str, objective: str, *,
+    verified_record_identity: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Build a bounded permission-filtered candidate catalog from page hint + prompt terms."""
     selected = scope.get("doctype")
+    verified_name = None
+    if verified_record_identity is not None:
+        if (
+            not isinstance(verified_record_identity, dict)
+            or set(verified_record_identity) != {"doctype", "record_name", "action", "evidence_hash"}
+            or verified_record_identity.get("doctype") != selected
+            or verified_record_identity.get("action") not in {"update", "delete"}
+            or not isinstance(verified_record_identity.get("record_name"), str)
+            or not verified_record_identity["record_name"]
+            or not isinstance(verified_record_identity.get("evidence_hash"), str)
+            or len(verified_record_identity["evidence_hash"]) != 64
+        ):
+            raise WorkflowProposalError(_("Verified record identity evidence is invalid"))
+        verified_name = verified_record_identity["record_name"]
     tokens = {
         token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", objective)
-        if token.lower() not in {"the", "and", "for", "with", "from", "into", "this", "that", "create", "update", "change", "edit", "read", "show", "open", "record", "document", "new"}
+        if token.lower() not in {"the", "and", "for", "with", "from", "into", "this", "that", "create", "update", "delete", "remove", "change", "edit", "read", "show", "open", "record", "document", "new"}
     }
+    # A DocType resolved by the native Desk/SPA surface is an authority ceiling,
+    # not merely a ranking hint.  Prompt discovery is useful on a generic home
+    # page, but allowing it here lets similarly named DocTypes (for example CRM
+    # Lead and ERPNext Lead) escape the form the user is actually viewing.
     names: set[str] = {selected} if selected else set()
-    if tokens:
+    if not selected and tokens:
         rows = frappe.get_all(
             "DocType", filters={"istable": 0},
             or_filters=[["name", "like", f"%{token}%"] for token in sorted(tokens)],
@@ -391,30 +818,65 @@ def _attended_form_catalogs(scope: dict[str, Any], user: str, objective: str) ->
     catalogs = []
     for doctype in ranked:
         try:
-            catalogs.append(_attended_form_catalog(doctype, scope.get("docname") if doctype == selected else None, user))
+            record_names = []
+            if doctype == selected and verified_name:
+                record_names.append(verified_name)
+            if not verified_name and doctype == selected and scope.get("docname"):
+                record_names.append(str(scope["docname"]))
+            if not verified_name:
+                record_names.extend(
+                    str(row["name"])
+                    for row in (scope.get("documents") or [])
+                    if isinstance(row, dict) and row.get("doctype") == doctype and row.get("name")
+                )
+            unique_names = list(dict.fromkeys(record_names))
+            identity_state = "unique" if len(unique_names) == 1 else "ambiguous" if unique_names else "missing"
+            catalogs.append(_attended_form_catalog(
+                doctype, unique_names[0] if len(unique_names) == 1 else None, user,
+                record_identity_state=identity_state,
+            ))
         except (frappe.PermissionError, MusterFormSchemaError):
             continue
     return catalogs
 
 
-def _attended_form_catalog(doctype: str, record_name: str | None, user: str) -> dict[str, Any]:
+def _attended_form_catalog(
+    doctype: str, record_name: str | None, user: str, *, record_identity_state: str = "missing",
+) -> dict[str, Any]:
     snapshot = effective_form_schema(doctype, user=user)
     fields = [
         {
             "fieldname": field["fieldname"], "label": field["label"],
             "fieldtype": field["fieldtype"], "required": field["required"],
+            "options": field.get("options"),
             "has_default": field["has_default"], "writable": field["writable"],
+            "create_writable": field.get("create_writable", field["writable"]),
+            "update_writable": field.get("update_writable", field["writable"]),
+            "source": (field.get("provenance") or {}).get("source", "doctype_field"),
+            "property_setter_count": len((field.get("provenance") or {}).get("property_setters") or []),
         }
         for field in snapshot["fields"][:120]
     ]
+    if record_name and (
+        not frappe.db.exists(doctype, record_name)
+        or not frappe.has_permission(doctype, "read", doc=record_name, user=user)
+    ):
+        record_name = None
+        record_identity_state = "unavailable"
     actions = ["read"]
     if snapshot["authority"]["create"]:
         actions.append("create")
     if record_name and snapshot["authority"]["write"]:
-        actions.append("update")
+        if frappe.has_permission(doctype, "write", doc=record_name, user=user):
+            actions.append("update")
+    if record_name and snapshot["authority"].get("delete"):
+        if frappe.has_permission(doctype, "delete", doc=record_name, user=user):
+            actions.append("delete")
     return {
         "doctype": doctype, "record_name": record_name, "actions": actions,
+        "record_identity_state": record_identity_state,
         "authority": snapshot["authority"], "fields": fields,
+        "doctype_property_setter_count": len(snapshot.get("doctype_property_setters") or []),
         "schema_hash": snapshot["schema_hash"], "revision": snapshot["revision"],
     }
 
@@ -422,10 +884,11 @@ def _attended_form_catalog(doctype: str, record_name: str | None, user: str) -> 
 def _materialize_attended_crud_bundle(
     descriptor_value: Any, graph_value: Any, catalogs: list[dict[str, Any]] | dict[str, Any] | None,
     allowed_capabilities: list[str], *, requested_kind: str = "governed_change",
+    objective: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Replace a model-selected record intent with a host-authored Desk plan.
 
-    The provider may choose create/update and scalar values only from the
+    The provider may choose create/update/delete and bounded values only from the
     supplied catalog. Routes, labels, semantic actions, schema hashes and
     revision evidence are authored here and never accepted from model output.
     """
@@ -440,6 +903,7 @@ def _materialize_attended_crud_bundle(
         raise WorkflowProposalError(_("The attended workflow proposal is not valid JSON")) from error
     available = set(allowed_capabilities)
     converted = 0
+    requested_action = _requested_attended_action(objective or "")
 
     def convert(execution: Any, capabilities: Any) -> tuple[dict[str, Any], list[str], bool]:
         if not isinstance(execution, dict) or not isinstance(execution.get("plan"), dict):
@@ -447,6 +911,10 @@ def _materialize_attended_crud_bundle(
         if execution.get("surface") == "browser":
             if requested_kind != "attended_browser":
                 raise WorkflowProposalError(_("A governed change must select values through the host form catalog"))
+            if requested_action in {"create", "update", "delete"}:
+                raise WorkflowProposalClarification(
+                    _("What form details should I use for this {0}?").format(requested_action)
+                )
             raw_actions = execution["plan"].get("actions")
             if not isinstance(raw_actions, list) or any(not isinstance(item, dict) or item.get("kind") not in {"navigate", "read_visible"} for item in raw_actions):
                 raise WorkflowProposalError(_("An attended read may not smuggle model-authored form mutations"))
@@ -463,18 +931,31 @@ def _materialize_attended_crud_bundle(
             return execution, capabilities, False
         intent = execution["plan"]
         operation = intent.get("operation")
-        if intent.get("capability") not in {"frappe.record.create", "frappe.record.update"} or not isinstance(operation, dict):
+        if intent.get("capability") not in {"frappe.record.create", "frappe.record.update", "frappe.record.delete"} or not isinstance(operation, dict):
             return execution, capabilities, False
         action = operation.get("action")
         catalog = next((item for item in catalogs if item["doctype"] == operation.get("doctype")), None)
-        if not catalog or operation.get("kind") != "record" or action not in {"create", "update"}:
+        if not catalog or operation.get("kind") != "record" or action not in {"create", "update", "delete"}:
             raise WorkflowProposalError(_("The change selected a DocType or action outside the live form catalog"))
+        if requested_action and action != requested_action:
+            raise WorkflowProposalClarification(
+                _("Should I create, update, or delete a record?")
+            )
+        if action in {"update", "delete"} and catalog.get("record_identity_state", "unique" if catalog.get("record_name") else "missing") != "unique":
+            raise WorkflowProposalClarification(
+                _("Which exact {0} record should I {1}?").format(catalog["doctype"], action)
+            )
         if action not in catalog["actions"]:
             raise WorkflowProposalError(_("The live actor cannot perform this form action"))
         values = operation.get("values")
-        if not isinstance(values, dict) or not values or len(values) > 100:
-            raise WorkflowProposalError(_("The attended change requires bounded form values"))
-        plan = _host_attended_browser_plan(action, values, catalog)
+        if action == "delete":
+            if values is not None or intent.get("approvalClass") != "dual_control":
+                raise WorkflowProposalError(_("Attended deletion requires a value-free dual-control intent"))
+            plan = _host_attended_delete_plan(catalog)
+        else:
+            if not isinstance(values, dict) or not values or len(values) > 100:
+                raise WorkflowProposalError(_("The attended change requires bounded form values"))
+            plan = _host_attended_browser_plan(action, values, catalog, objective=objective)
         required = _browser_plan_capabilities(plan)
         if "*" not in available and not required.issubset(available):
             raise WorkflowProposalError(_("The live actor lacks an attended browser capability"))
@@ -516,21 +997,83 @@ def _browser_plan_capabilities(plan: dict[str, Any]) -> set[str]:
     return {mapping[action["kind"]] for action in plan["actions"]}
 
 
-def _host_attended_browser_plan(action: str, values: dict[str, Any], catalog: dict[str, Any]) -> dict[str, Any]:
+def _host_attended_browser_plan(
+    action: str, values: dict[str, Any], catalog: dict[str, Any], *, objective: str | None = None,
+) -> dict[str, Any]:
     fields = {field["fieldname"]: field for field in catalog["fields"]}
     labels = [field["label"] for field in catalog["fields"]]
+    host_resolved_fields: set[str] = set()
     for fieldname, value in values.items():
         field = fields.get(fieldname)
-        if not field or not field["writable"] or labels.count(field["label"]) != 1:
+        operation_writable = field and field.get(
+            "create_writable" if action == "create" else "update_writable", field["writable"]
+        )
+        if not field or not operation_writable or labels.count(field["label"]) != 1:
             raise WorkflowProposalError(_("A selected form field is unavailable, ambiguous, hidden, read-only, or denied by permlevel"))
         if isinstance(value, (dict, list)) or value is None:
             raise WorkflowProposalError(_("Attended CRUD v1 accepts scalar visible form values only"))
-        if field["fieldtype"] not in {"Data", "Small Text", "Text", "Long Text", "Link", "Dynamic Link", "Date", "Datetime", "Time", "Int", "Float", "Currency", "Percent", "Phone", "Select", "Autocomplete"}:
+        if field["fieldtype"] not in {"Data", "Small Text", "Text", "Long Text", "Text Editor", "Link", "Dynamic Link", "Date", "Datetime", "Time", "Int", "Float", "Currency", "Percent", "Phone", "Select", "Autocomplete"}:
             raise WorkflowProposalError(_("A selected field type is not safely supported by attended CRUD v1"))
+        rendered = str(value)
+        if field["fieldtype"] == "Select":
+            allowed = [item.strip() for item in str(field.get("options") or "").splitlines() if item.strip()]
+            if not allowed or rendered not in allowed:
+                raise WorkflowProposalClarification(
+                    _("Choose an available value for {0}: {1}").format(field["label"], ", ".join(allowed[:12]))
+                )
+        if field["fieldtype"] == "Link":
+            linked_doctype = field.get("options")
+            link_is_valid = not (
+                not isinstance(linked_doctype, str)
+                or not linked_doctype
+                or not frappe.db.exists("DocType", linked_doctype)
+                or not frappe.db.exists(linked_doctype, rendered)
+                or not frappe.has_permission(linked_doctype, "read", doc=rendered, user=frappe.session.user)
+            )
+            if not link_is_valid and action == "create" and _redundant_link_alias(
+                rendered, field, catalog
+            ):
+                resolved = _configured_link_default(field, catalog)
+                if resolved:
+                    values[fieldname] = resolved
+                    rendered = resolved
+                    host_resolved_fields.add(fieldname)
+                    link_is_valid = True
+            if not link_is_valid:
+                raise WorkflowProposalClarification(
+                    _("Which existing permitted value should I use for {0}?").format(field["label"])
+                )
+        if field["fieldtype"] == "Dynamic Link":
+            raise WorkflowProposalError(_("Dynamic Link fields are not safely supported by attended CRUD v1"))
+    if objective is not None:
+        ungrounded = [
+            fields[fieldname]["label"] for fieldname, value in values.items()
+            if fieldname not in host_resolved_fields and not _objective_contains_scalar(objective, value)
+        ]
+        if ungrounded:
+            raise WorkflowProposalClarification(
+                _("What value should I use for {0}?").format(", ".join(ungrounded[:10]))
+            )
     if action == "create":
-        missing = [field["label"] for field in catalog["fields"] if field["required"] and field["writable"] and not field["has_default"] and field["fieldname"] not in values]
+        blocked = [
+            field["label"] for field in catalog["fields"]
+            if field["required"] and not field["has_default"]
+            and not field.get("create_writable", field["writable"])
+        ]
+        if blocked:
+            raise WorkflowProposalClarification(
+                _("This form requires {0}, but it is not editable with your current access.").format(", ".join(blocked[:10]))
+            )
+        missing = [
+            field["label"] for field in catalog["fields"]
+            if field["required"] and field.get("create_writable", field["writable"])
+            and not field["has_default"]
+            and (field["fieldname"] not in values or _missing_scalar(values[field["fieldname"]]))
+        ]
         if missing:
-            raise WorkflowProposalError(_("The attended create is missing required live form fields: {0}").format(", ".join(missing[:10])))
+            raise WorkflowProposalClarification(
+                _("What value should I use for {0}?").format(", ".join(missing[:10]))
+            )
     record_name = catalog["record_name"] if action == "update" else None
     if action == "update" and not record_name:
         raise WorkflowProposalError(_("Select an exact permitted record before preparing an attended update"))
@@ -566,6 +1109,137 @@ def _host_attended_browser_plan(action: str, values: dict[str, Any], catalog: di
             "fields": sorted(values), "schema_hash": catalog["schema_hash"], "revision": catalog["revision"],
         },
     })
+
+
+def _host_attended_delete_plan(catalog: dict[str, Any]) -> dict[str, Any]:
+    """Author the non-executing destructive review path entirely on the host."""
+    record_name = catalog.get("record_name")
+    if not record_name:
+        raise WorkflowProposalError(_("Select an exact permitted record before preparing a delete review"))
+    doctype_slug = frappe.scrub(catalog["doctype"]).replace("_", "-")
+    form_route = f"/desk/{doctype_slug}/{quote(record_name, safe='')}"
+    delete_target = {"kind": "role", "role": "button", "name": "Delete"}
+    plan = {
+        "schemaVersion": 1,
+        "actionBudget": 3,
+        "actions": [
+            {"kind": "navigate", "route": form_route, "doctype": catalog["doctype"], "recordName": record_name},
+            {
+                "kind": "click", "route": form_route, "doctype": catalog["doctype"], "recordName": record_name,
+                "target": {"kind": "role", "role": "button", "name": "Menu"},
+                "postcondition": {"kind": "target", "target": delete_target, "state": "visible"},
+            },
+            {
+                "kind": "read_visible", "route": form_route, "doctype": catalog["doctype"],
+                "recordName": record_name, "target": delete_target, "maxChars": 100,
+            },
+        ],
+        "attendedCrud": {
+            "operation": "delete", "doctype": catalog["doctype"], "record_name": record_name,
+            "fields": [], "schema_hash": catalog["schema_hash"], "revision": catalog["revision"],
+        },
+    }
+    return browser_action_plan(plan)
+
+
+def _words(value: Any) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(value or "").lower())
+
+
+def _redundant_link_alias(value: str, field: dict[str, Any], catalog: dict[str, Any]) -> bool:
+    """Recognize a record-type noun mistakenly repeated as a create-time Link value.
+
+    For example, users commonly say ``Create a CRM Lead ... Status Lead``. ``Lead``
+    identifies the record type, not a configured ``CRM Lead Status`` row. This
+    narrow check authorizes only host-side default resolution; it never admits an
+    arbitrary model value or selects a record identity.
+    """
+    supplied = _words(value)
+    target = _words(catalog.get("doctype"))
+    linked = _words(field.get("options"))
+    if not supplied or not target or not linked:
+        return False
+    return supplied == target or (
+        len(supplied) == 1 and supplied[0] == target[-1] and supplied[0] in linked
+    )
+
+
+def _configured_link_default(field: dict[str, Any], catalog: dict[str, Any]) -> str | None:
+    """Resolve a create default from live Frappe metadata and permission-filtered rows.
+
+    The provider cannot nominate this value. An effective field default wins. If
+    none exists, only linked masters with an explicit ``position`` field may
+    contribute their first caller-visible row. Masters without an ordering
+    contract remain ambiguous and still trigger clarification.
+    """
+    linked_doctype = field.get("options")
+    if not isinstance(linked_doctype, str) or not frappe.db.exists("DocType", linked_doctype):
+        return None
+    parent_meta = frappe.get_meta(catalog["doctype"], cached=False)
+    parent_field = parent_meta.get_field(field["fieldname"])
+    effective_default = str(getattr(parent_field, "default", "") or "").strip()
+    if (
+        effective_default
+        and frappe.db.exists(linked_doctype, effective_default)
+        and frappe.has_permission(
+            linked_doctype, "read", doc=effective_default, user=frappe.session.user
+        )
+    ):
+        return effective_default
+    linked_meta = frappe.get_meta(linked_doctype, cached=False)
+    if not linked_meta.has_field("position"):
+        return None
+    rows = frappe.get_list(
+        linked_doctype,
+        fields=["name"],
+        order_by="position asc, name asc",
+        limit_page_length=12,
+    )
+    for row in rows:
+        name = str(row.name if hasattr(row, "name") else row.get("name") or "").strip()
+        if name:
+            return name
+    return None
+
+
+def _missing_scalar(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _requested_attended_action(objective: str) -> str | None:
+    matches = [
+        action for action, pattern in (
+            ("create", r"\b(?:add|create|make|new|register)\b"),
+            ("update", r"\b(?:change|edit|modify|rename|set|update)\b"),
+            ("delete", r"\b(?:delete|remove|erase)\b"),
+        )
+        if re.search(pattern, objective, re.IGNORECASE)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _attended_preflight_clarification(objective: str, catalogs: list[dict[str, Any]]) -> str | None:
+    action = _requested_attended_action(objective)
+    if action not in {"update", "delete"}:
+        return None
+    identified = [
+        catalog for catalog in catalogs
+        if catalog.get("record_identity_state") == "unique" and catalog.get("record_name")
+    ]
+    if len(identified) == 1:
+        return None
+    if len(catalogs) == 1:
+        catalog = catalogs[0]
+        return _("Which exact {0} record should I {1}?").format(catalog["doctype"], action)
+    return _("Which exact record should I {0}?").format(action)
+
+
+def _objective_contains_scalar(objective: str, value: Any) -> bool:
+    if _missing_scalar(value) or isinstance(value, (dict, list)):
+        return False
+    objective_words = re.sub(r"[^a-z0-9]+", " ", objective.lower()).strip()
+    value_words = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+    return bool(value_words and f" {value_words} " in f" {objective_words} ")
 
 
 def _host_attended_read_plan(catalog: dict[str, Any]) -> dict[str, Any]:

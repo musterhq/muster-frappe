@@ -142,6 +142,45 @@ def seed_erpnext_records(*, site: str, scenario: str, scale: str) -> dict[str, A
             "ERPNext is not installed; ERPNext and HRMS business fixtures were skipped"
         )
     else:
+        default_company = frappe.defaults.get_global_default("company") or _first("Company")
+        inherited_currency = (
+            frappe.db.get_value("Company", default_company, "default_currency")
+            if default_company
+            else None
+        ) or frappe.defaults.get_global_default("currency") or "USD"
+        inherited_country = (
+            frappe.db.get_value("Company", default_company, "country")
+            if default_company
+            else None
+        ) or _first("Country") or "United States"
+        # HRMS v16 country fixtures are global, not company-scoped. Some regional
+        # packs contain duplicate Salary Component labels and can make every later
+        # Company insert fail after ERPNext has already built its chart. Use the
+        # standard non-regional demo locale when available so each Company still
+        # runs its real controller without replaying those broken global fixtures.
+        demo_country = (
+            "United States"
+            if frappe.db.exists("Country", "United States")
+            else inherited_country
+        )
+        demo_currency = "USD" if frappe.db.exists("Currency", "USD") else inherited_currency
+        company_names = [
+            "[Muster Demo] Company " + short_id(site, scenario, "company", index)
+            for index in range(profile.companies)
+        ]
+        result["entities"]["companies"] = _seed_entity(
+            key="companies",
+            doctype="Company",
+            target=profile.companies,
+            identity=lambda index: {"name": company_names[index]},
+            values=lambda index: {
+                "company_name": company_names[index],
+                "abbr": "M" + short_id(site, scenario, "company-abbr", index)[:4].upper(),
+                "default_currency": demo_currency,
+                "country": demo_country,
+            },
+        )
+
         customer_group = _first("Customer Group", {"is_group": 0}) or _first("Customer Group")
         territory = _first("Territory", {"is_group": 0}) or _first("Territory")
         supplier_group = _first("Supplier Group", {"is_group": 0}) or _first("Supplier Group")
@@ -189,9 +228,8 @@ def seed_erpnext_records(*, site: str, scenario: str, scale: str) -> dict[str, A
         else:
             result["warnings"].append("ERPNext Supplier Group master is incomplete")
 
-        company = frappe.defaults.get_global_default("company") or _first("Company")
         gender = _first("Gender")
-        if company and gender:
+        if company_names and gender:
             result["entities"]["employees"] = _seed_entity(
                 key="employees",
                 doctype="Employee",
@@ -205,7 +243,7 @@ def seed_erpnext_records(*, site: str, scenario: str, scale: str) -> dict[str, A
                     "gender": gender,
                     "date_of_birth": add_days("1980-01-01", index % 5000),
                     "date_of_joining": add_days("2020-01-01", index % 1500),
-                    "company": company,
+                    "company": company_names[index % len(company_names)],
                     "status": "Active",
                 },
             )
@@ -218,8 +256,12 @@ def seed_erpnext_records(*, site: str, scenario: str, scale: str) -> dict[str, A
         result["warnings"].append("Frappe CRM is not installed; CRM fixtures were skipped")
     else:
         currency = frappe.defaults.get_global_default("currency") or _first("Currency")
-        lead_status = _first("CRM Lead Status")
-        deal_status = _first("CRM Deal Status")
+        lead_status = _first("CRM Lead Status", {"name": "New"}) or _first(
+            "CRM Lead Status", {"type": ["in", ["Open", "Ongoing"]]}
+        )
+        deal_status = _first("CRM Deal Status", {"name": "Qualification"}) or _first(
+            "CRM Deal Status", {"type": ["in", ["Open", "Ongoing"]]}
+        )
 
         organization_names = [
             "[Muster Demo] Organization " + short_id(site, scenario, "crm-organization", index)
@@ -296,6 +338,7 @@ def seed_erpnext_records(*, site: str, scenario: str, scale: str) -> dict[str, A
             result["warnings"].append(f"{entity['doctype']}: " + ", ".join(entity["errors"]))
 
     required_entities = {
+        "companies",
         "customers",
         "suppliers",
         "employees",

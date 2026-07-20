@@ -2,10 +2,17 @@ frappe.ui.form.on("Muster Workflow Proposal", {
   refresh(frm) {
     render_proposal(frm);
     if (frm.is_new()) return;
-    const canManage = ["Muster Administrator", "Muster Automation Manager", "System Manager"].some((role) => frappe.user.has_role(role));
+    const canManage = ["Muster Administrator", "Muster Automation Manager", "Muster Approver", "System Manager"].some((role) => frappe.user.has_role(role));
     if (frm.doc.status === "Proposed" && canManage) {
-      frm.add_custom_button(__("Approve proposal"), () => review(frm, "approve"), __("Review"));
+      if (canApproveProposal(frm)) frm.add_custom_button(__("Approve proposal"), () => review(frm, "approve"), __("Review"));
       frm.add_custom_button(__("Reject"), () => review(frm, "reject"), __("Review"));
+    }
+    const destructiveTarget = attendedTarget(frm);
+    if (destructiveTarget && attendedOperation(frm) === "delete" && canManage) {
+      frm.add_custom_button(__("Open exact target"), () => frappe.set_route("Form", destructiveTarget.doctype, destructiveTarget.recordName), __("Review"));
+    }
+    if (canPreviewAttendedProposal(frm)) {
+      frm.add_custom_button(__("Open form preview"), () => previewInDesk(frm), __("Attended work"));
     }
     if (frm.doc.status === "Approved" && canManage) {
       frm.add_custom_button(__("Create & publish workflow"), () => publishProposal(frm), __("Workflow"));
@@ -16,7 +23,7 @@ frappe.ui.form.on("Muster Workflow Proposal", {
     if (canStartPublishedProposal(frm)) {
       frm.add_custom_button(__("Start governed mission"), () => startProposal(frm), __("Mission"));
     }
-    frm.dashboard.add_comment(__("This is inert JSON. Approval never executes it; publication creates a governed, immutable workflow version, and execution is a separate action."), "blue", true);
+    frm.dashboard.add_comment(__("Nothing has run. You can open an attended form preview without saving, or approve and publish this as a reusable workflow."), "blue", true);
   },
 });
 
@@ -28,19 +35,107 @@ function render_proposal(frm) {
   const escape = frappe.utils.escape_html;
   const render_step = (step) => {
     const children = step.steps || step.branches || step.subagents || [];
-    const capabilities = (step.capabilities || []).map((item) => `<code>${escape(item)}</code>`).join(" ");
-    return `<li><strong>${escape(step.label || step.kind)}</strong> <small>${escape(step.kind)}</small>${capabilities ? `<div>${capabilities}</div>` : ""}${children.length ? `<ol>${children.map(render_step).join("")}</ol>` : ""}</li>`;
+    return `<li><strong>${escape(step.label || __("Work step"))}</strong>${children.length ? `<ol>${children.map(render_step).join("")}</ol>` : ""}</li>`;
   };
-  const budget = proposal.budget || {};
-  let run = {};
-  try { run = JSON.parse(frm.doc.run_metadata_json || "{}"); } catch { /* evidence stays unavailable */ }
   target.html(`<div class="muster-proposal-preview">
     <p>${escape(proposal.meta?.description || "")}</p>
-    <div class="muster-proposal-budget"><span>${__("Runtime")}: ${Math.round((budget.runtimeMs || 0) / 60000)}m</span><span>${__("Tool calls")}: ${budget.toolCalls || 0}</span><span>${__("Model calls")}: ${budget.modelCalls || 0}</span><span>${__("Tokens")}: ${budget.tokens || 0}</span></div>
-    ${run.runId ? `<p class="text-muted">${__("Planned by")} ${escape(run.providerId)} / ${escape(run.model)} · ${escape(run.runId)} · ${__("read-only, offline")}</p>` : ""}
     <ol class="muster-proposal-steps">${(proposal.steps || []).map(render_step).join("")}</ol>
-    <p class="text-muted">${__("Review-only proposal. No tools or Frappe mutations run from this screen.")}</p>
+    <p class="text-muted">${__("Review only. Nothing changes in Frappe until you explicitly approve a Save or start a published workflow.")}</p>
   </div>`);
+  renderReviewedContext(frm);
+}
+
+function renderReviewedContext(frm) {
+  const target = frm.fields_dict.context_preview?.$wrapper?.empty();
+  if (!target) return;
+  try {
+    const graph = JSON.parse(frm.doc.compiled_graph_json || "{}");
+    const plans = (graph.nodes || []).flatMap((node) => node?.executionIntent?.plan?.attendedCrud ? [node.executionIntent.plan.attendedCrud] : []);
+    const plan = plans.length === 1 ? plans[0] : null;
+    if (!plan) {
+      target.html(`<div class="muster-proposal-preview"><strong>${__("Permission-filtered review")}</strong><p class="text-muted">${__("Muster used only the current user's live site permissions to prepare this proposal.")}</p></div>`);
+      return;
+    }
+    const fieldCount = Array.isArray(plan.fields) ? plan.fields.length : 0;
+    const action = plan.operation === "update" ? __("Update") : plan.operation === "delete" ? __("Delete") : __("Create");
+    const detail = plan.operation === "delete"
+      ? `${__("Exact record")}: ${frappe.utils.escape_html(plan.record_name || __("Unavailable"))}. ${__("A different authorized reviewer must approve this exact revision. Muster then requires the requester to type the exact name before one visible native Frappe deletion.")}`
+      : `${__("Reviewed fields")}: ${fieldCount}`;
+    target.html(`<div class="muster-proposal-preview"><strong>${frappe.utils.escape_html(action)} ${frappe.utils.escape_html(plan.doctype || __("record"))}</strong><p>${detail}</p><p class="text-muted">${__("Live permissions and the effective form schema will be checked again before attended work. Internal IDs and runtime diagnostics stay in the audit record, not this review screen.")}</p></div>`);
+  } catch {
+    target.html(`<div class="muster-proposal-preview"><strong>${__("Permission-filtered review")}</strong><p class="text-muted">${__("The reviewed context could not be displayed. Nothing has run.")}</p></div>`);
+  }
+}
+
+function canPreviewAttendedProposal(frm) {
+  if (!["Proposed", "Approved"].includes(frm.doc.status) || frm.doc.requested_by !== frappe.session.user) return false;
+  try {
+    const graph = JSON.parse(frm.doc.compiled_graph_json || "{}");
+    const attended = (graph.nodes || []).filter((node) => node?.executionIntent?.surface === "browser" && ["create", "update", "delete"].includes(node.executionIntent?.plan?.attendedCrud?.operation));
+    return attended.length === 1;
+  } catch {
+    return false;
+  }
+}
+
+function previewInDesk(frm) {
+  const destructive = attendedOperation(frm) === "delete";
+  const dialog = new frappe.ui.Dialog({
+    title: destructive ? __("Open destructive review") : __("Open attended form preview"),
+    fields: [{fieldname: "summary", fieldtype: "HTML", options: destructive
+      ? `<p>${__("Muster will open the exact real record and pause without changing it.")}</p><p class="text-muted">${__("After independent approval, typing the exact record name authorizes one short-lived attempt through Frappe's visible native Delete confirmation. Muster verifies absence and records a receipt afterward.")}</p>`
+      : `<p>${__("Muster will open the actual Frappe form and fill only the reviewed fields.")}</p><p class="text-muted">${__("It will pause before Save so you can inspect every value or take control.")}</p>`}],
+    primary_action_label: destructive ? __("Open exact record") : __("Open form and fill"),
+    async primary_action() {
+      dialog.disable_primary_action();
+      try {
+        const result = await frappe.call({
+          method: "muster.api.mission.prepare_attended_preview", type: "POST",
+          args: {proposal: frm.doc.name, confirmed: 1, idempotency_key: frappe.utils.get_random(24)},
+        });
+        if (!window.musterSurfaceAdapters?.start) throw new Error(__("The attended application surface is unavailable."));
+        dialog.hide();
+        await window.musterSurfaceAdapters.start(result.message);
+      } finally {
+        dialog.enable_primary_action();
+      }
+    },
+  });
+  dialog.show();
+}
+
+function attendedOperation(frm) {
+  try {
+    const graph = JSON.parse(frm.doc.compiled_graph_json || "{}");
+    const operations = (graph.nodes || []).flatMap((node) => node?.executionIntent?.plan?.attendedCrud?.operation ? [node.executionIntent.plan.attendedCrud.operation] : []);
+    return operations.length === 1 ? operations[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+function attendedTarget(frm) {
+  try {
+    const graph = JSON.parse(frm.doc.compiled_graph_json || "{}");
+    const bindings = (graph.nodes || []).flatMap((node) => node?.executionIntent?.plan?.attendedCrud ? [node.executionIntent.plan.attendedCrud] : []);
+    if (bindings.length !== 1) return null;
+    const binding = bindings[0];
+    if (typeof binding.doctype !== "string" || !binding.doctype.trim() || binding.doctype.length > 140
+      || typeof binding.record_name !== "string" || !binding.record_name.trim() || binding.record_name.length > 500
+      || /[\u0000-\u001f\u007f]/.test(`${binding.doctype}${binding.record_name}`)) return null;
+    return Object.freeze({doctype: binding.doctype, recordName: binding.record_name});
+  } catch {
+    return null;
+  }
+}
+
+function canApproveProposal(frm) {
+  if (frm.doc.status !== "Proposed") return false;
+  const operation = attendedOperation(frm);
+  if (["update", "delete"].includes(operation) && frm.doc.requested_by === frappe.session.user) return false;
+  if (operation !== "delete") return true;
+  const destructiveRole = ["Muster Administrator", "Muster Approver", "System Manager"].some((role) => frappe.user.has_role(role));
+  return destructiveRole;
 }
 
 function canStartPublishedProposal(frm) {
@@ -130,5 +225,5 @@ function startProposal(frm) {
 }
 
 if (typeof window !== "undefined") {
-  window.MusterWorkflowProposalUI = Object.freeze({canStartPublishedProposal, startProposal});
+  window.MusterWorkflowProposalUI = Object.freeze({attendedOperation, attendedTarget, canApproveProposal, canPreviewAttendedProposal, previewInDesk, canStartPublishedProposal, startProposal});
 }
